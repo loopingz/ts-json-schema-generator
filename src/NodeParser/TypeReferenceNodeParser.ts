@@ -88,7 +88,161 @@ export class TypeReferenceNodeParser implements SubNodeParser {
 
         if (node.typeArguments?.length) {
             for (const typeArg of node.typeArguments) {
-                subContext.pushArgument(this.childNodeParser.createType(typeArg, parentContext));
+                const created = this.childNodeParser.createType(typeArg, parentContext);
+                subContext.pushArgument(created);
+                // Store original raw ts.Type for later conditional checks
+                try {
+                    const raw = this.typeChecker.getTypeFromTypeNode(typeArg);
+                    if (raw) {
+                        subContext.pushOriginalTypeOrdered(raw);
+                    }
+                    // Special handling: if the type argument is an indexed access (e.g. T[K])
+                    // attempt to unwrap it to the raw property type of original T so that
+                    // conditional patterns like '{ toJSON(): infer U }' can see actual methods.
+                    if (ts.isIndexedAccessTypeNode(typeArg)) {
+                        const obj = typeArg.objectType;
+                        if (ts.isTypeReferenceNode(obj) && ts.isIdentifier(obj.typeName)) {
+                            const paramName = obj.typeName.text; // e.g. T
+                            const originalObj = parentContext.getOriginalType(paramName);
+                            try {
+                                console.log(
+                                    "[TypeRef] Indexed access param",
+                                    paramName,
+                                    "original exists?",
+                                    !!originalObj,
+                                );
+                            } catch {
+                                /* ignore */
+                            }
+                            if (originalObj) {
+                                let keyName: string | undefined;
+                                const idx = typeArg.indexType;
+                                if (ts.isTypeReferenceNode(idx) && ts.isIdentifier(idx.typeName)) {
+                                    const idxParamName = idx.typeName.text; // e.g. K
+                                    const arg = parentContext.getArgument(idxParamName);
+                                    try {
+                                        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+                                        if ((arg as any)?.getValue) {
+                                            // @ts-ignore
+                                            keyName = (arg as any).getValue();
+                                            try {
+                                                console.log("[TypeRef] Key from param", idxParamName, "=>", keyName);
+                                            } catch {
+                                                /* ignore */
+                                            }
+                                        }
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                } else if (ts.isLiteralTypeNode(idx)) {
+                                    if (ts.isStringLiteral(idx.literal) || ts.isNumericLiteral(idx.literal)) {
+                                        keyName = idx.literal.text;
+                                        try {
+                                            console.log("[TypeRef] Key from literal =>", keyName);
+                                        } catch {
+                                            /* ignore */
+                                        }
+                                    }
+                                }
+                                if (keyName) {
+                                    try {
+                                        const props = this.typeChecker.getPropertiesOfType(originalObj);
+                                        try {
+                                            console.log(
+                                                "[TypeRef] Original object props",
+                                                props.map((p) => p.getName()),
+                                            );
+                                        } catch {
+                                            /* ignore */
+                                        }
+                                        const propSymbol = props.find((p) => p.getName() === keyName);
+                                        if (propSymbol) {
+                                            const decl = propSymbol.valueDeclaration ?? propSymbol.declarations?.[0];
+                                            if (decl) {
+                                                const rawPropType = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                    propSymbol,
+                                                    decl,
+                                                );
+                                                if (rawPropType) {
+                                                    // Replace last pushed ordered raw (indexed access) with property raw type
+                                                    const list: any = (subContext as any).originalTypesInOrder;
+                                                    if (Array.isArray(list) && list.length > 0) {
+                                                        try {
+                                                            console.log(
+                                                                "[TypeRef] Replacing indexed raw with property raw",
+                                                                this.typeChecker.typeToString(rawPropType),
+                                                            );
+                                                        } catch {
+                                                            /* ignore */
+                                                        }
+                                                        list[list.length - 1] = rawPropType;
+                                                    } else {
+                                                        subContext.pushOriginalTypeOrdered(rawPropType);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        try {
+                                            console.log("[TypeRef] propSymbol not found for key", keyName);
+                                        } catch {
+                                            /* ignore */
+                                        }
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                }
+                            } else {
+                                try {
+                                    console.log("[TypeRef] keyName unresolved for indexed access");
+                                } catch {
+                                    /* ignore */
+                                }
+                            }
+                            // Brute force fallback: if last original ordered type still an IndexedAccess, attempt to derive raw via its internal ts.IndexedAccessType structure.
+                            try {
+                                const list: any = (subContext as any).originalTypesInOrder;
+                                if (Array.isArray(list) && list.length > 0) {
+                                    const lastRaw = list[list.length - 1];
+                                    if (lastRaw && (lastRaw.flags & ts.TypeFlags.IndexedAccess) !== 0) {
+                                        const idxType: any = lastRaw; // ts.IndexedAccessType
+                                        const objectType: ts.Type = idxType.objectType;
+                                        const indexType: ts.Type = idxType.indexType;
+                                        const indexStr = this.typeChecker.typeToString(indexType);
+                                        const objProps = this.typeChecker.getPropertiesOfType(objectType);
+                                        const sym = objProps.find((p) => p.getName() === indexStr);
+                                        if (sym) {
+                                            const decl2 = sym.valueDeclaration ?? sym.declarations?.[0];
+                                            if (decl2) {
+                                                const brute = this.typeChecker.getTypeOfSymbolAtLocation(sym, decl2);
+                                                if (brute) {
+                                                    list[list.length - 1] = brute;
+                                                    try {
+                                                        console.log(
+                                                            "[TypeRef] Brute replaced indexed raw with",
+                                                            this.typeChecker.typeToString(brute),
+                                                        );
+                                                    } catch {
+                                                        /* ignore */
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            try {
+                                                console.log("[TypeRef] Brute could not find property", indexStr);
+                                            } catch {
+                                                /* ignore */
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch {
+                                /* ignore */
+                            }
+                        }
+                    }
+                } catch {
+                    /* ignore */
+                }
             }
         }
 

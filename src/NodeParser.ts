@@ -10,6 +10,12 @@ export class Context {
     private parameters: string[] = [];
     private reference?: ts.Node;
     private defaultArgument = new Map<string, BaseType>();
+    // Keep a mapping to original (non transformed) TypeScript types so that
+    // conditional type evaluation (extends checks, property access etc.) can
+    // refer back to full, unstripped type information when needed.
+    private originalTypes = new Map<string, ts.Type>();
+    // Ordered list of original types aligned with argument positions (before parameter names are known)
+    private originalTypesInOrder: ts.Type[] = [];
 
     public constructor(reference?: ts.Node) {
         this.reference = reference;
@@ -22,6 +28,21 @@ export class Context {
 
     public pushParameter(parameterName: string): void {
         this.parameters.push(parameterName);
+    }
+
+    /** Store original (raw) TypeScript type for a given parameter */
+    public pushOriginalType(parameterName: string, type: ts.Type): void {
+        this.originalTypes.set(parameterName, type);
+    }
+
+    /** Push original type by argument order before parameter names are bound */
+    public pushOriginalTypeOrdered(type: ts.Type): void {
+        this.originalTypesInOrder.push(type);
+    }
+
+    /** Get original (raw) TypeScript type if available */
+    public getOriginalType(parameterName: string): ts.Type | undefined {
+        return this.originalTypes.get(parameterName);
     }
 
     public setDefault(parameterName: string, argumentType: BaseType): void {
@@ -53,6 +74,16 @@ export class Context {
     }
     public getArguments(): readonly BaseType[] {
         return this.arguments;
+    }
+
+    /** Get all stored original types (for propagation to child contexts) */
+    public getOriginalTypes(): Map<string, ts.Type> {
+        return this.originalTypes;
+    }
+
+    /** Get original type by argument index (used when later binding parameter names) */
+    public getOriginalTypeByIndex(index: number): ts.Type | undefined {
+        return this.originalTypesInOrder[index];
     }
 
     public getReference(): ts.Node | undefined {

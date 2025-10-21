@@ -19,9 +19,101 @@ export class TypeAliasNodeParser implements SubNodeParser {
 
     public createType(node: ts.TypeAliasDeclaration, context: Context, reference?: ReferenceType): BaseType {
         if (node.typeParameters?.length) {
-            for (const typeParam of node.typeParameters) {
+            for (let i = 0; i < node.typeParameters.length; i++) {
+                const typeParam = node.typeParameters[i];
                 const nameSymbol = this.typeChecker.getSymbolAtLocation(typeParam.name)!;
                 context.pushParameter(nameSymbol.name);
+                // Bind previously captured original raw type by index if available
+                let raw = context.getOriginalTypeByIndex(i);
+                if (raw) {
+                    try {
+                        console.log(
+                            "  binding raw for alias param",
+                            nameSymbol.name,
+                            this.typeChecker.typeToString(raw),
+                            raw.flags,
+                        );
+                    } catch {
+                        /* ignore */
+                    }
+                } else {
+                    console.log("  no raw found for alias param", nameSymbol.name, i);
+                }
+                if (raw) {
+                    const existingOriginal = context.getOriginalType(nameSymbol.name);
+                    const isIndexed = (raw.flags & ts.TypeFlags.IndexedAccess) !== 0;
+                    let skipOverride = false;
+                    if (existingOriginal && isIndexed) {
+                        try {
+                            const existingProps = this.typeChecker.getPropertiesOfType(existingOriginal);
+                            if (existingProps.length > 0) {
+                                skipOverride = true; // keep richer original (with methods)
+                                console.log(
+                                    "  skip overriding original raw for",
+                                    nameSymbol.name,
+                                    "with indexed access raw",
+                                );
+                            }
+                        } catch {
+                            /* ignore */
+                        }
+                    }
+                    // Attempt to unwrap indexed access raw (T[K]) to property raw type of original T
+                    if (!skipOverride && isIndexed) {
+                        try {
+                            const idxRaw: any = raw; // ts.IndexedAccessType
+                            const objectType: ts.Type = idxRaw.objectType;
+                            const indexType: ts.Type = idxRaw.indexType;
+                            const objectSymbol = objectType.getSymbol();
+                            // If objectType is the generic parameter itself, try parent original
+                            if (objectSymbol && (objectType.flags & ts.TypeFlags.TypeParameter) !== 0) {
+                                const paramBaseName = objectSymbol.getName();
+                                const parentOriginal = context.getOriginalType(paramBaseName);
+                                if (parentOriginal) {
+                                    let keyNames: string[] = [];
+                                    if ((indexType.flags & ts.TypeFlags.Union) !== 0) {
+                                        keyNames = (indexType as ts.UnionType).types.map((t) =>
+                                            this.typeChecker.typeToString(t),
+                                        );
+                                    } else {
+                                        keyNames = [this.typeChecker.typeToString(indexType)];
+                                    }
+                                    const props = this.typeChecker.getPropertiesOfType(parentOriginal);
+                                    for (const kn of keyNames) {
+                                        const propSym = props.find((p) => p.getName() === kn);
+                                        if (propSym) {
+                                            const decl = propSym.valueDeclaration ?? propSym.declarations?.[0];
+                                            if (decl) {
+                                                const propRaw = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                    propSym,
+                                                    decl,
+                                                );
+                                                if (propRaw) {
+                                                    console.log(
+                                                        "  unwrapped indexed access raw for alias param",
+                                                        nameSymbol.name,
+                                                        "property",
+                                                        kn,
+                                                        this.typeChecker.typeToString(propRaw),
+                                                    );
+                                                    // Replace raw with property raw type
+                                                    // so that conditional toJSON pattern can see method.
+                                                    raw = propRaw;
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        } catch {
+                            /* ignore */
+                        }
+                    }
+                    if (!skipOverride) {
+                        context.pushOriginalType(nameSymbol.name, raw);
+                    }
+                }
 
                 if (typeParam.default) {
                     const type = this.childNodeParser.createType(typeParam.default, context);
@@ -52,7 +144,7 @@ export class TypeAliasNodeParser implements SubNodeParser {
                         ts.NodeBuilderFlags.NoTruncation,
                     );
                     if (apparentNode && ts.isTypeNode(apparentNode)) {
-                        underlyingNode = apparentNode;
+                        underlyingNode = apparentNode as ts.TypeNode;
                     }
                     console.log("  apparent", safeNodePrint(underlyingNode, node.getSourceFile(), this.typeChecker));
                 }

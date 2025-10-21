@@ -181,13 +181,19 @@ export class MappedTypeNodeParser implements SubNodeParser {
     ): Context {
         const subContext = new Context(node);
 
+        // Propagate parameters, arguments and original raw types
         for (const parentParameter of parentContext.getParameters()) {
             subContext.pushParameter(parentParameter);
             subContext.pushArgument(parentContext.getArgument(parentParameter));
+            const original = parentContext.getOriginalType(parentParameter);
+            if (original) {
+                subContext.pushOriginalType(parentParameter, original);
+            }
         }
 
         subContext.pushParameter(node.typeParameter.name.text);
         subContext.pushArgument(key);
+        // Key is a literal; no original raw type needed
 
         return subContext;
     }
