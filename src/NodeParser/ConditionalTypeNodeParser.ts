@@ -29,8 +29,78 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
         const checkType = this.childNodeParser.createType(node.checkType, context);
         const extendsType = this.childNodeParser.createType(node.extendsType, context);
         const checkTypeParameterName = this.getTypeParameterName(node.checkType);
-
+        console.log("condition type called");
         const inferMap = new Map();
+        const rawCheckType = this.typeChecker.getTypeFromTypeNode(node.checkType);
+        const rawExtendsType = this.typeChecker.getTypeFromTypeNode(node.extendsType);
+        if (rawCheckType && rawExtendsType) {
+            // Resolve
+            const describeType = (type: ts.Type): any => {
+                const symbol = type.getSymbol();
+                const isUnion = (type.flags & ts.TypeFlags.Union) !== 0;
+                const isIntersection = (type.flags & ts.TypeFlags.Intersection) !== 0;
+                const members = isUnion || isIntersection ? (type as ts.UnionOrIntersectionType).types : [];
+                return {
+                    text: this.typeChecker.typeToString(type),
+                    flags: type.flags,
+                    kind: isUnion ? "union" : isIntersection ? "intersection" : "single",
+                    constituents: members.map((t) => this.typeChecker.typeToString(t)),
+                    properties: symbol
+                        ? this.typeChecker.getPropertiesOfType(type).map((s) => {
+                              const decl = s.valueDeclaration ?? s.declarations?.[0];
+                              let propType: ts.Type | undefined;
+                              try {
+                                  if (decl) {
+                                      propType = this.typeChecker.getTypeOfSymbolAtLocation(s, decl);
+                                  }
+                              } catch {
+                                  /* ignore */
+                              }
+                              return {
+                                  name: s.getName(),
+                                  optional: !!(s.getFlags() & ts.SymbolFlags.Optional),
+                                  type: propType ? this.typeChecker.typeToString(propType) : undefined,
+                              };
+                          })
+                        : undefined,
+                    constraint: (type as any).getConstraint
+                        ? (() => {
+                              try {
+                                  const c = (type as any).getConstraint();
+                                  return c ? this.typeChecker.typeToString(c) : undefined;
+                              } catch {
+                                  return undefined;
+                              }
+                          })()
+                        : undefined,
+                    default: (type as any).getDefault
+                        ? (() => {
+                              try {
+                                  const d = (type as any).getDefault();
+                                  return d ? this.typeChecker.typeToString(d) : undefined;
+                              } catch {
+                                  return undefined;
+                              }
+                          })()
+                        : undefined,
+                    aliasSymbol: (type as any).aliasSymbol ? (type as any).aliasSymbol.getName() : undefined,
+                };
+            };
+
+            try {
+                console.log("  readable rawCheckType", JSON.stringify(describeType(rawCheckType), null, 2));
+            } catch {
+                /* ignore serialization issues */
+            }
+            console.log(
+                "  raw",
+                this.typeChecker.typeToString(rawCheckType),
+                "extends",
+                this.typeChecker.typeToString(rawExtendsType),
+                "=>",
+                this.typeChecker.isTypeAssignableTo(rawCheckType, rawExtendsType),
+            );
+        }
 
         // If check-type is not a type parameter then condition is very simple, no type narrowing needed
         if (checkTypeParameterName == null) {

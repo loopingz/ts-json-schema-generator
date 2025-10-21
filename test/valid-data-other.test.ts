@@ -56,7 +56,13 @@ describe("valid-data-other", () => {
     it("generic-default", assertValidSchema("generic-default", "MyObject"));
     it("generic-nested", assertValidSchema("generic-nested", "MyObject"));
     it("generic-prefixed-number", assertValidSchema("generic-prefixed-number", "MyObject"));
-    it("generic-void", assertValidSchema("generic-void", "MyObject"));
+    it("generic-true-hell", assertValidSchema("generic-true-hell", "MyObject"));
+    it(
+        "generic-void",
+        assertValidSchema("generic-void", "MyObject", {
+            functions: "comment",
+        }),
+    );
 
     it("nullable-null", assertValidSchema("nullable-null", "MyObject"));
 

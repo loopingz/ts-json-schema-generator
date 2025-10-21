@@ -37,11 +37,49 @@ export class TypeAliasNodeParser implements SubNodeParser {
             reference.setName(name);
         }
 
-        const type = this.childNodeParser.createType(node.type, context);
+        // Detect presence of 'infer' within the alias type definition.
+        const hasInfer = this.containsInfer(node.type);
+        let underlyingNode: ts.TypeNode = node.type;
+        console.log("hasInfer", hasInfer, safeNodePrint(node.type, node.getSourceFile(), this.typeChecker));
+        if (hasInfer && false) {
+            try {
+                const sourceTsType = this.typeChecker.getTypeAtLocation(node.type);
+                const apparent = this.typeChecker.getApparentType(sourceTsType);
+                if (apparent !== sourceTsType) {
+                    const apparentNode = this.typeChecker.typeToTypeNode(
+                        apparent,
+                        node,
+                        ts.NodeBuilderFlags.NoTruncation,
+                    );
+                    if (apparentNode && ts.isTypeNode(apparentNode)) {
+                        underlyingNode = apparentNode;
+                    }
+                    console.log("  apparent", safeNodePrint(underlyingNode, node.getSourceFile(), this.typeChecker));
+                }
+            } catch (e) {
+                // Swallow; fallback to original node
+                console.log("hasInfer error", e);
+            }
+        }
+        const type = this.childNodeParser.createType(underlyingNode, context);
         if (type instanceof NeverType) {
             return new NeverType();
         }
         return new AliasType(id, type);
+    }
+
+    private containsInfer(node: ts.TypeNode): boolean {
+        let found = false;
+        const visit = (n: ts.Node) => {
+            if (found) return;
+            if (n.kind === ts.SyntaxKind.InferType) {
+                found = true;
+                return;
+            }
+            n.forEachChild(visit);
+        };
+        visit(node);
+        return found;
     }
 
     protected getTypeId(node: ts.TypeAliasDeclaration, context: Context): string {
@@ -53,5 +91,32 @@ export class TypeAliasNodeParser implements SubNodeParser {
         const fullName = node.name.getText();
 
         return argumentIds.length ? `${fullName}<${argumentIds.join(",")}>` : fullName;
+    }
+}
+function safeNodePrint(type: ts.TypeNode, arg1: ts.SourceFile, typeChecker: ts.TypeChecker): any {
+    try {
+        const printer = ts.createPrinter({ removeComments: true });
+        const printed = printer.printNode(ts.EmitHint.Unspecified, type, arg1);
+        const tsType = typeChecker.getTypeAtLocation(type);
+        let typeString: string;
+        try {
+            typeString = typeChecker.typeToString(tsType, undefined, ts.TypeFormatFlags.NoTruncation);
+        } catch {
+            typeString = typeChecker.typeToString(tsType);
+        }
+        return {
+            printed,
+            type: typeString,
+            kind: ts.SyntaxKind[type.kind],
+            flags: tsType.flags,
+            aliasSymbol: tsType.aliasSymbol?.escapedName,
+        };
+    } catch (e) {
+        try {
+            const fallback = typeChecker.typeToString(typeChecker.getTypeAtLocation(type));
+            return { printed: fallback, error: String(e) };
+        } catch {
+            return { printed: "/*error printing type*/", error: String(e) };
+        }
     }
 }

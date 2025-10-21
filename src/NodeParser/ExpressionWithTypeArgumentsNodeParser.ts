@@ -15,15 +15,19 @@ export class ExpressionWithTypeArgumentsNodeParser implements SubNodeParser {
     }
     public createType(node: ts.ExpressionWithTypeArguments, context: Context): BaseType {
         const typeSymbol = this.typeChecker.getSymbolAtLocation(node.expression)!;
+        console.log(typeSymbol.name, typeSymbol.flags);
         if (typeSymbol.flags & ts.SymbolFlags.Alias) {
             const aliasedSymbol = this.typeChecker.getAliasedSymbol(typeSymbol);
+            console.log("  aliased to", aliasedSymbol.name, aliasedSymbol.flags);
             return this.childNodeParser.createType(
                 aliasedSymbol.declarations![0],
                 this.createSubContext(node, context),
             );
         } else if (typeSymbol.flags & ts.SymbolFlags.TypeParameter) {
+            console.log("  is type parameter", typeSymbol.name);
             return context.getArgument(typeSymbol.name);
         } else {
+            console.log("  is declaration", typeSymbol.declarations![0].kind);
             return this.childNodeParser.createType(typeSymbol.declarations![0], this.createSubContext(node, context));
         }
     }
