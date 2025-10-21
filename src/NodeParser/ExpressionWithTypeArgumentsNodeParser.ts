@@ -43,6 +43,25 @@ export class ExpressionWithTypeArgumentsNodeParser implements SubNodeParser {
                     const raw = this.typeChecker.getTypeFromTypeNode(typeArg);
                     if (raw) {
                         subContext.pushOriginalTypeOrdered(raw);
+                        // If the raw is just a type parameter, attempt to upgrade it using parentContext original type.
+                        try {
+                            if (
+                                (raw.flags & ts.TypeFlags.TypeParameter) !== 0 &&
+                                ts.isTypeReferenceNode(typeArg) &&
+                                ts.isIdentifier(typeArg.typeName)
+                            ) {
+                                const paramName = typeArg.typeName.text;
+                                const parentOriginal = parentContext.getOriginalType(paramName);
+                                if (parentOriginal) {
+                                    const list: any = (subContext as any).originalTypesInOrder;
+                                    if (Array.isArray(list) && list.length > 0) {
+                                        list[list.length - 1] = parentOriginal;
+                                    }
+                                }
+                            }
+                        } catch {
+                            /* ignore */
+                        }
                     }
                     // Special handling: Indexed access like T[K] should map to raw property type of original T
                     if (ts.isIndexedAccessTypeNode(typeArg)) {

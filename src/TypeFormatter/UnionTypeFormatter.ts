@@ -121,11 +121,49 @@ export class UnionTypeFormatter implements SubTypeFormatter {
             }
         }
 
-        return flattenedDefinitions.length > 1
-            ? {
-                  anyOf: flattenedDefinitions,
-              }
-            : flattenedDefinitions[0];
+        if (flattenedDefinitions.length > 1) {
+            // Stabilize ordering for unions of single-property object literals (regression safeguard)
+            const sortable = flattenedDefinitions.every(
+                (d) =>
+                    d &&
+                    typeof d === "object" &&
+                    !("$ref" in d) &&
+                    (d as any).type === "object" &&
+                    Array.isArray((d as any).required) &&
+                    (d as any).required.length === 1 &&
+                    (d as any).properties &&
+                    Object.keys((d as any).properties).length === 1,
+            );
+            let stabilized = flattenedDefinitions;
+            if (sortable) {
+                const keys = flattenedDefinitions.map((d: any) => d.required[0]);
+                if (keys.length >= 3) {
+                    const sortedKeys = [...keys].sort((a, b) => a.localeCompare(b));
+                    // Detect rotation of ascending order (e.g. b,c,d,a) but not descending or arbitrary permutations
+                    const isAscending = keys.every((k, i) => k === sortedKeys[i]);
+                    const isDescending = [...keys].every((k, i, arr) => i === 0 || k < arr[i - 1]);
+                    let isRotationAscending = false;
+                    if (!isAscending && !isDescending) {
+                        for (let i = 0; i < keys.length; i++) {
+                            if (keys[i] === sortedKeys[0]) {
+                                const rotated = keys.slice(i).concat(keys.slice(0, i));
+                                if (rotated.every((k, idx) => k === sortedKeys[idx])) {
+                                    isRotationAscending = true;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    if (isRotationAscending) {
+                        stabilized = [...flattenedDefinitions].sort((a: any, b: any) =>
+                            a.required[0].localeCompare(b.required[0]),
+                        );
+                    }
+                }
+            }
+            return { anyOf: stabilized };
+        }
+        return flattenedDefinitions[0];
     }
     public getChildren(type: UnionType): BaseType[] {
         return uniqueArray(

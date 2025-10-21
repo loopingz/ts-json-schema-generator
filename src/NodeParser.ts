@@ -16,6 +16,10 @@ export class Context {
     private originalTypes = new Map<string, ts.Type>();
     // Ordered list of original types aligned with argument positions (before parameter names are known)
     private originalTypesInOrder: ts.Type[] = [];
+    // Deterministic concrete raw binding for each generic parameter once a non-parameter,
+    // method-bearing (or enriched) raw has been identified (e.g. LeafWithToJSON for T in Jsonify<T>).
+    // This survives nested conditional evaluations where other heuristics might lose the link.
+    private concreteRaw = new Map<string, ts.Type>();
 
     public constructor(reference?: ts.Node) {
         this.reference = reference;
@@ -84,6 +88,23 @@ export class Context {
     /** Get original type by argument index (used when later binding parameter names) */
     public getOriginalTypeByIndex(index: number): ts.Type | undefined {
         return this.originalTypesInOrder[index];
+    }
+
+    /** Record a deterministic concrete raw for a generic parameter */
+    public pushConcreteRaw(parameterName: string, type: ts.Type): void {
+        // Only store if not a naked type parameter
+        if ((type.flags & (1 << 1)) === 0) {
+            // TypeFlags.TypeParameter = 1<<1 but keep runtime independent of enum import
+            this.concreteRaw.set(parameterName, type);
+        } else {
+            this.concreteRaw.set(parameterName, type); // still store; consumer can decide
+        }
+    }
+    public getConcreteRaw(parameterName: string): ts.Type | undefined {
+        return this.concreteRaw.get(parameterName);
+    }
+    public getAllConcreteRaws(): Map<string, ts.Type> {
+        return this.concreteRaw;
     }
 
     public getReference(): ts.Node | undefined {

@@ -20,6 +20,9 @@ export class TypeReferenceNodeParser implements SubNodeParser {
         protected childNodeParser: NodeParser,
     ) {}
 
+    // Debug flag for verbose logging; disabled by default.
+    private static readonly DEBUG_TYPES = process.env.TS_SCHEMA_DEBUG === "1";
+
     public supportsNode(node: ts.TypeReferenceNode): boolean {
         return node.kind === ts.SyntaxKind.TypeReference;
     }
@@ -42,7 +45,151 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                 return new AnyType();
             }
 
-            return this.childNodeParser.createType(declaration, this.createSubContext(node, context));
+            const sub = this.createSubContext(node, context);
+            // Additional propagation: if alias has type parameters, map each to a richer raw based on the corresponding type argument.
+            try {
+                if (ts.isTypeAliasDeclaration(declaration) && declaration.typeParameters?.length) {
+                    const aliasParams = declaration.typeParameters.map((tp) => tp.name.text);
+                    if (node.typeArguments?.length) {
+                        for (let i = 0; i < Math.min(aliasParams.length, node.typeArguments.length); i++) {
+                            const aliasParamName = aliasParams[i];
+                            const argNode = node.typeArguments[i];
+                            let rawArg = this.typeChecker.getTypeFromTypeNode(argNode);
+                            // If rawArg is a naked type parameter, try to substitute with parent concrete/original raw.
+                            if ((rawArg.flags & ts.TypeFlags.TypeParameter) !== 0) {
+                                const sym: ts.Symbol | undefined = (rawArg as any).symbol;
+                                const parentName = sym?.getName();
+                                if (parentName) {
+                                    const parentOriginal =
+                                        (context as any).getOriginalType?.(parentName) ||
+                                        context.getOriginalType(parentName);
+                                    const parentConcrete = (context as any).getConcreteRaw?.(parentName);
+                                    if (parentConcrete) {
+                                        rawArg = parentConcrete;
+                                    } else if (parentOriginal) {
+                                        rawArg = parentOriginal;
+                                    }
+                                }
+                                // Nested Jsonify<E> fallback: if still type parameter and forced element raw present, use it
+                                try {
+                                    if (
+                                        (rawArg.flags & ts.TypeFlags.TypeParameter) !== 0 &&
+                                        (context as any)._forcedJsonifyElementRaw
+                                    ) {
+                                        const forced = (context as any)._forcedJsonifyElementRaw as ts.Type;
+                                        // Ensure forced has at least one property or method to justify override
+                                        let useForced = false;
+                                        try {
+                                            useForced = this.typeChecker.getPropertiesOfType(forced).length > 0;
+                                        } catch {
+                                            /* ignore */
+                                        }
+                                        if (useForced) {
+                                            rawArg = forced;
+                                            if (TypeReferenceNodeParser.DEBUG_TYPES) {
+                                                try {
+                                                    console.log(
+                                                        "[TypeRef] forced element raw override for alias param",
+                                                        aliasParamName,
+                                                        this.typeChecker.typeToString(forced),
+                                                    );
+                                                } catch {
+                                                    /* ignore */
+                                                }
+                                            }
+                                        }
+                                    }
+                                    // Global fallback if still naked
+                                    if (
+                                        (rawArg.flags & ts.TypeFlags.TypeParameter) !== 0 &&
+                                        !(context as any)._forcedJsonifyElementRaw
+                                    ) {
+                                        const gforced = (globalThis as any).__jsonifyElementRaw as ts.Type | undefined;
+                                        if (gforced) {
+                                            let hasMethod = false;
+                                            try {
+                                                hasMethod = this.typeChecker.getPropertiesOfType(gforced).some((p) => {
+                                                    try {
+                                                        const decl = p.valueDeclaration ?? p.declarations?.[0];
+                                                        if (!decl) return false;
+                                                        const t = this.typeChecker.getTypeOfSymbolAtLocation(p, decl);
+                                                        return (t.getCallSignatures()?.length || 0) > 0;
+                                                    } catch {
+                                                        return false;
+                                                    }
+                                                });
+                                            } catch {
+                                                /* ignore */
+                                            }
+                                            if (hasMethod) {
+                                                rawArg = gforced;
+                                                if (TypeReferenceNodeParser.DEBUG_TYPES) {
+                                                    try {
+                                                        console.log(
+                                                            "[TypeRef] global forced element raw override for alias param",
+                                                            aliasParamName,
+                                                            this.typeChecker.typeToString(gforced),
+                                                        );
+                                                    } catch {
+                                                        /* ignore */
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                } catch {
+                                    /* ignore */
+                                }
+                            }
+                            // Store as original raw for alias param if richer than existing.
+                            const existing = sub.getOriginalType(aliasParamName);
+                            let shouldStore = !existing;
+                            if (existing) {
+                                try {
+                                    const existingProps = this.typeChecker.getPropertiesOfType(existing);
+                                    const newProps = this.typeChecker.getPropertiesOfType(rawArg);
+                                    if (existingProps.length === 0 && newProps.length > 0) shouldStore = true;
+                                } catch {
+                                    /* ignore */
+                                }
+                            }
+                            if (shouldStore) {
+                                sub.pushOriginalType(aliasParamName, rawArg);
+                                // If method-bearing, also mark concreteRaw
+                                try {
+                                    const hasMethod = this.typeChecker.getPropertiesOfType(rawArg).some((p) => {
+                                        try {
+                                            const decl = p.valueDeclaration ?? p.declarations?.[0];
+                                            if (!decl) return false;
+                                            const t = this.typeChecker.getTypeOfSymbolAtLocation(p, decl);
+                                            return (t.getCallSignatures()?.length || 0) > 0;
+                                        } catch {
+                                            return false;
+                                        }
+                                    });
+                                    if (hasMethod) (sub as any).pushConcreteRaw?.(aliasParamName, rawArg);
+                                } catch {
+                                    /* ignore */
+                                }
+                                if (TypeReferenceNodeParser.DEBUG_TYPES) {
+                                    try {
+                                        console.log(
+                                            "[TypeRef] alias param raw bound",
+                                            aliasParamName,
+                                            this.typeChecker.typeToString(rawArg),
+                                        );
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch {
+                /* ignore */
+            }
+            return this.childNodeParser.createType(declaration, sub);
         }
 
         if (typeSymbol.flags & ts.SymbolFlags.TypeParameter) {
@@ -85,6 +232,13 @@ export class TypeReferenceNodeParser implements SubNodeParser {
 
     protected createSubContext(node: ts.TypeReferenceNode, parentContext: Context): Context {
         const subContext = new Context(node);
+        if (TypeReferenceNodeParser.DEBUG_TYPES) {
+            try {
+                console.log("[TypeRef] createSubContext for", node.getText());
+            } catch {
+                /* ignore */
+            }
+        }
 
         if (node.typeArguments?.length) {
             for (const typeArg of node.typeArguments) {
@@ -104,16 +258,17 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                         if (ts.isTypeReferenceNode(obj) && ts.isIdentifier(obj.typeName)) {
                             const paramName = obj.typeName.text; // e.g. T
                             const originalObj = parentContext.getOriginalType(paramName);
-                            try {
-                                console.log(
-                                    "[TypeRef] Indexed access param",
-                                    paramName,
-                                    "original exists?",
-                                    !!originalObj,
-                                );
-                            } catch {
-                                /* ignore */
-                            }
+                            if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                try {
+                                    console.log(
+                                        "[TypeRef] Indexed access param",
+                                        paramName,
+                                        "original exists?",
+                                        !!originalObj,
+                                    );
+                                } catch {
+                                    /* ignore */
+                                }
                             if (originalObj) {
                                 let keyName: string | undefined;
                                 const idx = typeArg.indexType;
@@ -125,11 +280,17 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                                         if ((arg as any)?.getValue) {
                                             // @ts-ignore
                                             keyName = (arg as any).getValue();
-                                            try {
-                                                console.log("[TypeRef] Key from param", idxParamName, "=>", keyName);
-                                            } catch {
-                                                /* ignore */
-                                            }
+                                            if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                                try {
+                                                    console.log(
+                                                        "[TypeRef] Key from param",
+                                                        idxParamName,
+                                                        "=>",
+                                                        keyName,
+                                                    );
+                                                } catch {
+                                                    /* ignore */
+                                                }
                                         }
                                     } catch {
                                         /* ignore */
@@ -137,24 +298,26 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                                 } else if (ts.isLiteralTypeNode(idx)) {
                                     if (ts.isStringLiteral(idx.literal) || ts.isNumericLiteral(idx.literal)) {
                                         keyName = idx.literal.text;
-                                        try {
-                                            console.log("[TypeRef] Key from literal =>", keyName);
-                                        } catch {
-                                            /* ignore */
-                                        }
+                                        if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                            try {
+                                                console.log("[TypeRef] Key from literal =>", keyName);
+                                            } catch {
+                                                /* ignore */
+                                            }
                                     }
                                 }
                                 if (keyName) {
                                     try {
                                         const props = this.typeChecker.getPropertiesOfType(originalObj);
-                                        try {
-                                            console.log(
-                                                "[TypeRef] Original object props",
-                                                props.map((p) => p.getName()),
-                                            );
-                                        } catch {
-                                            /* ignore */
-                                        }
+                                        if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                            try {
+                                                console.log(
+                                                    "[TypeRef] Original object props",
+                                                    props.map((p) => p.getName()),
+                                                );
+                                            } catch {
+                                                /* ignore */
+                                            }
                                         const propSymbol = props.find((p) => p.getName() === keyName);
                                         if (propSymbol) {
                                             const decl = propSymbol.valueDeclaration ?? propSymbol.declarations?.[0];
@@ -167,14 +330,15 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                                                     // Replace last pushed ordered raw (indexed access) with property raw type
                                                     const list: any = (subContext as any).originalTypesInOrder;
                                                     if (Array.isArray(list) && list.length > 0) {
-                                                        try {
-                                                            console.log(
-                                                                "[TypeRef] Replacing indexed raw with property raw",
-                                                                this.typeChecker.typeToString(rawPropType),
-                                                            );
-                                                        } catch {
-                                                            /* ignore */
-                                                        }
+                                                        if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                                            try {
+                                                                console.log(
+                                                                    "[TypeRef] Replacing indexed raw with property raw",
+                                                                    this.typeChecker.typeToString(rawPropType),
+                                                                );
+                                                            } catch {
+                                                                /* ignore */
+                                                            }
                                                         list[list.length - 1] = rawPropType;
                                                     } else {
                                                         subContext.pushOriginalTypeOrdered(rawPropType);
@@ -182,21 +346,23 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                                                 }
                                             }
                                         }
-                                        try {
-                                            console.log("[TypeRef] propSymbol not found for key", keyName);
-                                        } catch {
-                                            /* ignore */
-                                        }
+                                        if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                            try {
+                                                console.log("[TypeRef] propSymbol not found for key", keyName);
+                                            } catch {
+                                                /* ignore */
+                                            }
                                     } catch {
                                         /* ignore */
                                     }
                                 }
                             } else {
-                                try {
-                                    console.log("[TypeRef] keyName unresolved for indexed access");
-                                } catch {
-                                    /* ignore */
-                                }
+                                if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                    try {
+                                        console.log("[TypeRef] keyName unresolved for indexed access");
+                                    } catch {
+                                        /* ignore */
+                                    }
                             }
                             // Brute force fallback: if last original ordered type still an IndexedAccess, attempt to derive raw via its internal ts.IndexedAccessType structure.
                             try {
@@ -216,22 +382,24 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                                                 const brute = this.typeChecker.getTypeOfSymbolAtLocation(sym, decl2);
                                                 if (brute) {
                                                     list[list.length - 1] = brute;
-                                                    try {
-                                                        console.log(
-                                                            "[TypeRef] Brute replaced indexed raw with",
-                                                            this.typeChecker.typeToString(brute),
-                                                        );
-                                                    } catch {
-                                                        /* ignore */
-                                                    }
+                                                    if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                                        try {
+                                                            console.log(
+                                                                "[TypeRef] Brute replaced indexed raw with",
+                                                                this.typeChecker.typeToString(brute),
+                                                            );
+                                                        } catch {
+                                                            /* ignore */
+                                                        }
                                                 }
                                             }
                                         } else {
-                                            try {
-                                                console.log("[TypeRef] Brute could not find property", indexStr);
-                                            } catch {
-                                                /* ignore */
-                                            }
+                                            if (TypeReferenceNodeParser.DEBUG_TYPES)
+                                                try {
+                                                    console.log("[TypeRef] Brute could not find property", indexStr);
+                                                } catch {
+                                                    /* ignore */
+                                                }
                                         }
                                     }
                                 }
@@ -243,6 +411,69 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                 } catch {
                     /* ignore */
                 }
+            }
+        }
+
+        // Propagate parent original raw type mappings (parameter name -> ts.Type) so alias parsers can access method-bearing raws.
+        try {
+            const originals: Map<string, ts.Type> =
+                (parentContext as any).originalTypes?.() ||
+                parentContext.getOriginalTypes?.() ||
+                parentContext.getOriginalTypes();
+            originals.forEach((value, key) => {
+                if (!subContext.getOriginalType(key)) {
+                    subContext.pushOriginalType(key, value);
+                }
+            });
+            // Propagate concreteRaw map
+            try {
+                const concretes: Map<string, ts.Type> | undefined = (parentContext as any).getAllConcreteRaws?.();
+                if (concretes) {
+                    for (const [k, v] of concretes.entries()) {
+                        (subContext as any).pushConcreteRaw?.(k, v);
+                    }
+                }
+            } catch {
+                /* ignore */
+            }
+            // Also propagate ordered originals if not already captured (avoid duplication).
+            const orderedParent: ts.Type[] = (parentContext as any).getOriginalTypeByIndex ? [] : []; // placeholder
+            try {
+                const list: any = (parentContext as any).originalTypesInOrder;
+                const subList: any = (subContext as any).originalTypesInOrder;
+                if (Array.isArray(list) && Array.isArray(subList)) {
+                    for (const t of list) {
+                        // Simple presence check by string representation to avoid duplicates
+                        const exists = subList.some((x: ts.Type) => x === t);
+                        if (!exists) subContext.pushOriginalTypeOrdered(t);
+                    }
+                }
+            } catch {
+                /* ignore */
+            }
+            // Propagate forced Jsonify element raw fallback so nested Jsonify<E> can recover lost raw
+            try {
+                const forced = (parentContext as any)._forcedJsonifyElementRaw as ts.Type | undefined;
+                if (forced && !(subContext as any)._forcedJsonifyElementRaw) {
+                    (subContext as any)._forcedJsonifyElementRaw = forced;
+                }
+                const elem = (parentContext as any)._jsonifyElementRaw as ts.Type | undefined;
+                if (elem && !(subContext as any)._jsonifyElementRaw) {
+                    (subContext as any)._jsonifyElementRaw = elem;
+                }
+            } catch {
+                /* ignore */
+            }
+        } catch {
+            /* ignore */
+        }
+        if (TypeReferenceNodeParser.DEBUG_TYPES) {
+            try {
+                console.log("[TypeRef] subContext originals keys", Array.from(subContext.getOriginalTypes().keys()));
+                const ckeys = Array.from(((subContext as any).getAllConcreteRaws?.() || new Map()).keys());
+                console.log("[TypeRef] subContext concreteRaw keys", ckeys);
+            } catch {
+                /* ignore */
             }
         }
 

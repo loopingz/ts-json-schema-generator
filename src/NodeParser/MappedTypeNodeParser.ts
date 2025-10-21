@@ -21,6 +21,8 @@ import { getKey } from "../Utils/nodeKey.js";
 import { preserveAnnotation } from "../Utils/preserveAnnotation.js";
 import { removeUndefined } from "../Utils/removeUndefined.js";
 import { uniqueTypeArray } from "../Utils/uniqueTypeArray.js";
+// DEBUG flag for conditional/mapped interaction (enable with TS_SCHEMA_DEBUG=1)
+const DEBUG_MAPPED = process.env.TS_SCHEMA_DEBUG === "1";
 
 export class MappedTypeNodeParser implements SubNodeParser {
     public constructor(
@@ -115,10 +117,64 @@ export class MappedTypeNodeParser implements SubNodeParser {
             .map((type) => [type, this.mapKey(node, type, context)])
             .filter((value): value is [LiteralType, LiteralType] => value[1] instanceof LiteralType)
             .reduce((result: ObjectProperty[], [key, mappedKey]: [LiteralType, LiteralType]) => {
-                const propertyType = this.childNodeParser.createType(
-                    node.type!,
-                    this.createSubContext(node, key, context),
-                );
+                const subContext = this.createSubContext(node, key, context);
+                const propertyType = this.childNodeParser.createType(node.type!, subContext);
+
+                // Attempt early substitution for method-based serialization patterns:
+                // 1. toJSON(): infer U (handled by finding toJSON and substituting its return type)
+                // 2. fromDto(param: infer U): any  (Dto pattern) -> we keep U's shape instead of the whole object
+                // Detect pattern by inspecting original raw type for this key name.
+                try {
+                    const keyName = key.getValue().toString();
+                    const rawProp = subContext.getOriginalType(keyName);
+                    if (rawProp) {
+                        const tc: ts.TypeChecker | undefined = (this.childNodeParser as any).typeChecker;
+                        if (tc) {
+                            // Skip arrays: let conditional branch handle (infer E)[] logic.
+                            const isArray = !!tc.getIndexTypeOfType(rawProp, ts.IndexKind.Number);
+                            if (!isArray) {
+                                const props = tc.getPropertiesOfType(rawProp);
+                                // Only consider explicit toJSON; ignore common prototype methods.
+                                const processMethodReturnType = (methodSym: ts.Symbol, label: string) => {
+                                    const decl = methodSym.valueDeclaration ?? methodSym.declarations?.[0];
+                                    if (!decl) return;
+                                    const mType = tc.getTypeOfSymbolAtLocation(methodSym, decl);
+                                    const sig = mType.getCallSignatures()?.[0];
+                                    if (!sig) return;
+                                    const ret = sig.getReturnType();
+                                    const retNode = tc.typeToTypeNode(ret, undefined, ts.NodeBuilderFlags.NoTruncation);
+                                    if (retNode && ts.isTypeNode(retNode)) {
+                                        const replaced = this.childNodeParser.createType(retNode, subContext);
+                                        if (replaced) {
+                                            if (DEBUG_MAPPED) {
+                                                try {
+                                                    console.log(
+                                                        "[Mapped] substituted",
+                                                        label,
+                                                        "return for",
+                                                        keyName,
+                                                        tc.typeToString(ret),
+                                                    );
+                                                } catch {}
+                                            }
+                                            (propertyType as any) = replaced;
+                                        }
+                                    }
+                                };
+                                const toJSONSym = props.find((p) => p.getName && p.getName() === "toJSON");
+                                if (toJSONSym) {
+                                    const declSource = (rawProp as any).symbol?.declarations || [];
+                                    const validDeclSource = declSource.some(
+                                        (d: ts.Declaration) => ts.isClassDeclaration(d) || ts.isInterfaceDeclaration(d),
+                                    );
+                                    if (validDeclSource) processMethodReturnType(toJSONSym, "toJSON");
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    /* ignore */
+                }
 
                 let newType = derefAnnotatedType(propertyType);
                 let hasUndefined = false;
@@ -194,6 +250,50 @@ export class MappedTypeNodeParser implements SubNodeParser {
         subContext.pushParameter(node.typeParameter.name.text);
         subContext.pushArgument(key);
         // Key is a literal; no original raw type needed
+
+        // Attempt to propagate raw property type for Jsonify mapped distribution:
+        // If parent generic parameter (e.g., T) has an original raw object with properties,
+        // find the property symbol matching this key literal and push its raw ts.Type for reuse.
+        try {
+            const parentParams = parentContext.getParameters();
+            // Attempt to find a suitable raw object among parent parameters (generic T or direct source object)
+            for (const paramName of parentParams) {
+                const rawObj = parentContext.getOriginalType(paramName);
+                if (!rawObj) continue;
+                const tc: ts.TypeChecker | undefined = (this.childNodeParser as any).typeChecker;
+                if (!tc) continue;
+                const props = tc.getPropertiesOfType(rawObj);
+                const keyName = (key as any).getValue ? (key as any).getValue().toString() : undefined;
+                if (!keyName) continue;
+                const propSym = props.find((p: any) => p.getName && p.getName() === keyName);
+                if (propSym) {
+                    const decl = propSym.valueDeclaration ?? propSym.declarations?.[0];
+                    if (decl) {
+                        const propRaw = tc.getTypeOfSymbolAtLocation(propSym, decl);
+                        if (propRaw) {
+                            subContext.pushOriginalType(paramName, rawObj);
+                            subContext.pushOriginalType(keyName, propRaw);
+                            if ((subContext as any).pushOriginalTypeOrdered) {
+                                (subContext as any).pushOriginalTypeOrdered(propRaw);
+                            }
+                            if (DEBUG_MAPPED) {
+                                try {
+                                    console.log(
+                                        "[Mapped] captured raw property",
+                                        keyName,
+                                        "from",
+                                        paramName,
+                                        tc.typeToString(propRaw),
+                                    );
+                                } catch {}
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            /* ignore */
+        }
 
         return subContext;
     }
