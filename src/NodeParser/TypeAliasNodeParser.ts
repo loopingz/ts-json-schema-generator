@@ -13,29 +13,11 @@ export class TypeAliasNodeParser implements SubNodeParser {
         protected childNodeParser: NodeParser,
     ) {}
 
-    // Debug flag for verbose alias parsing logs
-    private static readonly DEBUG_TYPES = process.env.TS_SCHEMA_DEBUG === "1";
-
     public supportsNode(node: ts.TypeAliasDeclaration): boolean {
         return node.kind === ts.SyntaxKind.TypeAliasDeclaration;
     }
 
     public createType(node: ts.TypeAliasDeclaration, context: Context, reference?: ReferenceType): BaseType {
-        if (TypeAliasNodeParser.DEBUG_TYPES) {
-            try {
-                const concreteKeys = Array.from(((context as any).getAllConcreteRaws?.() || new Map()).keys());
-                console.log(
-                    "[Alias] entering alias",
-                    node.name.getText(),
-                    "concreteRaw keys",
-                    concreteKeys,
-                    "originalType keys",
-                    Array.from(context.getOriginalTypes().keys()),
-                );
-            } catch {
-                /* ignore */
-            }
-        }
         if (node.typeParameters?.length) {
             for (let i = 0; i < node.typeParameters.length; i++) {
                 const typeParam = node.typeParameters[i];
@@ -51,12 +33,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                         // Only override if current raw is missing or a naked type parameter / indexed access without richer props
                         if (!raw || (raw.flags & ts.TypeFlags.TypeParameter) !== 0) {
                             raw = existingConcrete;
-                            if (TypeAliasNodeParser.DEBUG_TYPES)
-                                console.log(
-                                    "  prefer existing concreteRaw for",
-                                    nameSymbol.name,
-                                    this.typeChecker.typeToString(existingConcrete),
-                                );
                         }
                     }
                 } catch {
@@ -83,12 +59,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                         }
                         if (useForced) {
                             raw = forced;
-                            if (TypeAliasNodeParser.DEBUG_TYPES)
-                                console.log(
-                                    "  using forced element raw for",
-                                    nameSymbol.name,
-                                    this.typeChecker.typeToString(forced),
-                                );
                         }
                     }
                     // Global fallback (last known element raw) if still a naked type parameter
@@ -113,12 +83,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                 });
                                 if (hasMethod) {
                                     raw = globalForced;
-                                    if (TypeAliasNodeParser.DEBUG_TYPES)
-                                        console.log(
-                                            "  global forced element raw for",
-                                            nameSymbol.name,
-                                            this.typeChecker.typeToString(globalForced),
-                                        );
                                 }
                             }
                         } catch {
@@ -149,12 +113,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                             /* ignore */
                         }
                         if (indexHasMethod) {
-                            if (TypeAliasNodeParser.DEBUG_TYPES)
-                                console.log(
-                                    "  replacing type parameter raw with index candidate for",
-                                    nameSymbol.name,
-                                    this.typeChecker.typeToString(indexCandidate),
-                                );
                             raw = indexCandidate;
                         }
                     } else if (!raw && indexCandidate) {
@@ -188,13 +146,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                     /* ignore */
                                 }
                                 if (hasAnyMethod) {
-                                    if (TypeAliasNodeParser.DEBUG_TYPES)
-                                        console.log(
-                                            "  ordered rescue (pre-binding) replacing type parameter raw for",
-                                            nameSymbol.name,
-                                            "with",
-                                            this.typeChecker.typeToString(cand),
-                                        );
                                     raw = cand;
                                     break;
                                 }
@@ -338,6 +289,7 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                 }
                             } else {
                                 // Try forced element raw
+                                // TODO Remove
                                 try {
                                     const forced = (context as any)._forcedJsonifyElementRaw as ts.Type | undefined;
                                     if (forced) {
@@ -346,12 +298,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                             .some((p) => p.getName && p.getName() === "toJSON");
                                         if (hasToJSON) {
                                             raw = forced;
-                                            if (TypeAliasNodeParser.DEBUG_TYPES)
-                                                console.log(
-                                                    "  forced element raw rescue for",
-                                                    nameSymbol.name,
-                                                    this.typeChecker.typeToString(forced),
-                                                );
                                         }
                                     }
                                 } catch {
@@ -383,21 +329,8 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                 // to successfully infer E. We only record the element as a concreteRaw so that
                                 // later method pattern detection can still discover methods (e.g., toJSON) on
                                 // the element while preserving array shape for inference.
-                                if (TypeAliasNodeParser.DEBUG_TYPES)
-                                    console.log(
-                                        "  enriching array raw for",
-                                        nameSymbol.name,
-                                        "using element type",
-                                        this.typeChecker.typeToString(elem),
-                                    );
                                 try {
                                     (context as any).pushConcreteRaw?.(nameSymbol.name, elem);
-                                    if (TypeAliasNodeParser.DEBUG_TYPES)
-                                        console.log(
-                                            "  concreteRaw stored (array element) for",
-                                            nameSymbol.name,
-                                            this.typeChecker.typeToString(elem),
-                                        );
                                 } catch {
                                     /* ignore */
                                 }
@@ -422,12 +355,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                             const existingProps = this.typeChecker.getPropertiesOfType(existingOriginal);
                             if (existingProps.length > 0) {
                                 skipOverride = true; // keep richer original (with methods)
-                                if (TypeAliasNodeParser.DEBUG_TYPES)
-                                    console.log(
-                                        "  skip overriding original raw for",
-                                        nameSymbol.name,
-                                        "with indexed access raw",
-                                    );
                             }
                         } catch {
                             /* ignore */
@@ -460,13 +387,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                             });
                             if (existingMethods.length > 0 && newMethods.length === 0) {
                                 skipOverride = true;
-                                if (TypeAliasNodeParser.DEBUG_TYPES)
-                                    console.log(
-                                        "  skip overriding method-bearing original for",
-                                        nameSymbol.name,
-                                        "methods:",
-                                        existingMethods.map((m) => m.getName()),
-                                    );
                             }
                         } catch {
                             /* ignore */
@@ -503,14 +423,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                                     decl,
                                                 );
                                                 if (propRaw) {
-                                                    if (TypeAliasNodeParser.DEBUG_TYPES)
-                                                        console.log(
-                                                            "  unwrapped indexed access raw for alias param",
-                                                            nameSymbol.name,
-                                                            "property",
-                                                            kn,
-                                                            this.typeChecker.typeToString(propRaw),
-                                                        );
                                                     // Replace raw with property raw type
                                                     // so that conditional toJSON pattern can see method.
                                                     raw = propRaw;
@@ -576,16 +488,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                             }
                             if (shouldStore) {
                                 (context as any).pushConcreteRaw?.(nameSymbol.name, raw);
-                                if (TypeAliasNodeParser.DEBUG_TYPES)
-                                    console.log(
-                                        "  concreteRaw stored for",
-                                        nameSymbol.name,
-                                        this.typeChecker.typeToString(raw),
-                                    );
-                            } else if (TypeAliasNodeParser.DEBUG_TYPES) {
-                                try {
-                                    console.log("  concreteRaw skip overwrite for", nameSymbol.name);
-                                } catch {}
                             }
                         } catch {
                             /* ignore */
@@ -617,56 +519,12 @@ export class TypeAliasNodeParser implements SubNodeParser {
         }
 
         // Detect presence of 'infer' within the alias type definition.
-        const hasInfer = this.containsInfer(node.type);
         let underlyingNode: ts.TypeNode = node.type;
-        if (TypeAliasNodeParser.DEBUG_TYPES)
-            console.log("hasInfer", hasInfer, safeNodePrint(node.type, node.getSourceFile(), this.typeChecker));
-        if (hasInfer && false) {
-            try {
-                const sourceTsType = this.typeChecker.getTypeAtLocation(node.type);
-                const apparent = this.typeChecker.getApparentType(sourceTsType);
-                if (apparent !== sourceTsType) {
-                    const apparentNode = this.typeChecker.typeToTypeNode(
-                        apparent,
-                        node,
-                        ts.NodeBuilderFlags.NoTruncation,
-                    );
-                    if (apparentNode) {
-                        const apparentNodeChecked: ts.Node = apparentNode!; // non-undefined after guard
-                        if (ts.isTypeNode(apparentNodeChecked)) {
-                            underlyingNode = apparentNodeChecked as ts.TypeNode;
-                        }
-                    }
-                    if (TypeAliasNodeParser.DEBUG_TYPES)
-                        console.log(
-                            "  apparent",
-                            safeNodePrint(underlyingNode, node.getSourceFile(), this.typeChecker),
-                        );
-                }
-            } catch (e) {
-                // Swallow; fallback to original node
-                if (TypeAliasNodeParser.DEBUG_TYPES) console.log("hasInfer error", e);
-            }
-        }
         const type = this.childNodeParser.createType(underlyingNode, context);
         if (type instanceof NeverType) {
             return new NeverType();
         }
         return new AliasType(id, type);
-    }
-
-    private containsInfer(node: ts.TypeNode): boolean {
-        let found = false;
-        const visit = (n: ts.Node) => {
-            if (found) return;
-            if (n.kind === ts.SyntaxKind.InferType) {
-                found = true;
-                return;
-            }
-            n.forEachChild(visit);
-        };
-        visit(node);
-        return found;
     }
 
     protected getTypeId(node: ts.TypeAliasDeclaration, context: Context): string {
@@ -678,32 +536,5 @@ export class TypeAliasNodeParser implements SubNodeParser {
         const fullName = node.name.getText();
 
         return argumentIds.length ? `${fullName}<${argumentIds.join(",")}>` : fullName;
-    }
-}
-function safeNodePrint(type: ts.TypeNode, arg1: ts.SourceFile, typeChecker: ts.TypeChecker): any {
-    try {
-        const printer = ts.createPrinter({ removeComments: true });
-        const printed = printer.printNode(ts.EmitHint.Unspecified, type, arg1);
-        const tsType = typeChecker.getTypeAtLocation(type);
-        let typeString: string;
-        try {
-            typeString = typeChecker.typeToString(tsType, undefined, ts.TypeFormatFlags.NoTruncation);
-        } catch {
-            typeString = typeChecker.typeToString(tsType);
-        }
-        return {
-            printed,
-            type: typeString,
-            kind: ts.SyntaxKind[type.kind],
-            flags: tsType.flags,
-            aliasSymbol: tsType.aliasSymbol?.escapedName,
-        };
-    } catch (e) {
-        try {
-            const fallback = typeChecker.typeToString(typeChecker.getTypeAtLocation(type));
-            return { printed: fallback, error: String(e) };
-        } catch {
-            return { printed: "/*error printing type*/", error: String(e) };
-        }
     }
 }

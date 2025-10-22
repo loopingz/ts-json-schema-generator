@@ -21,8 +21,6 @@ import { getKey } from "../Utils/nodeKey.js";
 import { preserveAnnotation } from "../Utils/preserveAnnotation.js";
 import { removeUndefined } from "../Utils/removeUndefined.js";
 import { uniqueTypeArray } from "../Utils/uniqueTypeArray.js";
-// DEBUG flag for conditional/mapped interaction (enable with TS_SCHEMA_DEBUG=1)
-const DEBUG_MAPPED = process.env.TS_SCHEMA_DEBUG === "1";
 
 export class MappedTypeNodeParser implements SubNodeParser {
     public constructor(
@@ -146,17 +144,6 @@ export class MappedTypeNodeParser implements SubNodeParser {
                                     if (retNode && ts.isTypeNode(retNode)) {
                                         const replaced = this.childNodeParser.createType(retNode, subContext);
                                         if (replaced) {
-                                            if (DEBUG_MAPPED) {
-                                                try {
-                                                    console.log(
-                                                        "[Mapped] substituted",
-                                                        label,
-                                                        "return for",
-                                                        keyName,
-                                                        tc.typeToString(ret),
-                                                    );
-                                                } catch {}
-                                            }
                                             (propertyType as any) = replaced;
                                         }
                                     }
@@ -275,17 +262,6 @@ export class MappedTypeNodeParser implements SubNodeParser {
                             subContext.pushOriginalType(keyName, propRaw);
                             if ((subContext as any).pushOriginalTypeOrdered) {
                                 (subContext as any).pushOriginalTypeOrdered(propRaw);
-                            }
-                            if (DEBUG_MAPPED) {
-                                try {
-                                    console.log(
-                                        "[Mapped] captured raw property",
-                                        keyName,
-                                        "from",
-                                        paramName,
-                                        tc.typeToString(propRaw),
-                                    );
-                                } catch {}
                             }
                         }
                     }

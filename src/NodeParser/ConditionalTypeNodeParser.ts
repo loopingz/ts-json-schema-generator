@@ -26,18 +26,11 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
         protected childNodeParser: NodeParser,
     ) {}
 
-    private static readonly DEBUG_TYPES = process.env.TS_SCHEMA_DEBUG === "1";
-
     public supportsNode(node: ts.ConditionalTypeNode): boolean {
         return node.kind === ts.SyntaxKind.ConditionalType;
     }
 
     public createType(node: ts.ConditionalTypeNode, context: Context): BaseType {
-        if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-            try {
-                console.log("[Conditional] extends kind", ts.SyntaxKind[node.extendsType.kind]);
-            } catch {}
-        }
         const checkType = this.childNodeParser.createType(node.checkType, context);
         const extendsType = this.childNodeParser.createType(node.extendsType, context);
         const checkTypeParameterName = this.getTypeParameterName(node.checkType);
@@ -249,15 +242,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                         } catch {
                             /* ignore */
                         }
-                        if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                            try {
-                                console.log(
-                                    "[Conditional] universal array infer captured raw",
-                                    inferName,
-                                    this.typeChecker.typeToString(elemRawUniversal),
-                                );
-                            } catch {}
-                        }
                     }
                 }
             } catch {
@@ -280,15 +264,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                     if (elemNode && ts.isTypeNode(elemNode)) {
                         const elemBaseType = this.childNodeParser.createType(elemNode, context);
                         inferMap.set(inferName, elemBaseType);
-                        if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                            try {
-                                console.log(
-                                    "[Conditional] early array branch element",
-                                    inferName,
-                                    this.typeChecker.typeToString(elemRaw),
-                                );
-                            } catch {}
-                        }
                         // Bind original raw for inferName if missing (ensure class methods preserved)
                         if (!context.getOriginalType(inferName)) context.pushOriginalType(inferName, elemRaw);
                         // Ensure elemRaw is first in ordered originals so alias param T binds to LeafWithToJSON not previous raw.
@@ -298,14 +273,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                 list.unshift(elemRaw);
                             } else {
                                 context.pushOriginalTypeOrdered(elemRaw);
-                            }
-                            if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                try {
-                                    console.log(
-                                        "[Conditional] ordered originals after unshift",
-                                        list?.map((t: ts.Type) => this.typeChecker.typeToString(t)),
-                                    );
-                                } catch {}
                             }
                         } catch {
                             /* ignore */
@@ -331,15 +298,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                             const aliasParamName = aliasDecl.typeParameters[0].name.text; // 'T' in Jsonify<T>
                                             if (!sub.getOriginalType(aliasParamName)) {
                                                 sub.pushOriginalType(aliasParamName, elemRaw);
-                                                if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                                    try {
-                                                        console.log(
-                                                            "[Conditional] bound alias param raw",
-                                                            aliasParamName,
-                                                            this.typeChecker.typeToString(elemRaw),
-                                                        );
-                                                    } catch {}
-                                                }
                                                 // Also push elemRaw into ordered originals at front of sub context
                                                 try {
                                                     (sub as any).originalTypesInOrder = [
@@ -425,14 +383,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                 if (boundRawType && (boundRawType.flags & ts.TypeFlags.TypeParameter) !== 0) {
                     const resolved = this.resolveTypeParameterRaw(boundRawType, context, extendsMethodName);
                     if (resolved && resolved !== boundRawType) {
-                        if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                            try {
-                                console.log(
-                                    "[Conditional] enriched type parameter raw",
-                                    this.typeChecker.typeToString(resolved),
-                                );
-                            } catch {}
-                        }
                         boundRawType = resolved;
                     }
                 }
@@ -515,14 +465,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                     if (elemFallback) {
                                         const props = this.typeChecker.getPropertiesOfType(elemFallback);
                                         if (props.some((p) => p.getName() === extendsMethodName)) {
-                                            if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                                try {
-                                                    console.log(
-                                                        "[Conditional] using _jsonifyElementRaw fallback for method pattern",
-                                                        this.typeChecker.typeToString(elemFallback),
-                                                    );
-                                                } catch {}
-                                            }
                                             targetRaw = elemFallback;
                                         }
                                     }
@@ -534,16 +476,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                     } catch {
                         /* ignore */
                     }
-                    if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                        try {
-                            console.log(
-                                "[Conditional] object method pattern targetRaw",
-                                this.typeChecker.typeToString(targetRaw),
-                                "method",
-                                extendsMethodName,
-                            );
-                        } catch {}
-                    }
                     // Ultimate forced fallback: if still a naked type parameter and a forced element raw exists with the method, substitute it.
                     try {
                         if ((targetRaw.flags & ts.TypeFlags.TypeParameter) !== 0) {
@@ -554,16 +486,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                     .some((s) => s.getName() === extendsMethodName);
                                 if (hasForced) {
                                     targetRaw = forced;
-                                    if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                        try {
-                                            console.log(
-                                                "[Conditional] forced element raw override for method pattern",
-                                                this.typeChecker.typeToString(forced),
-                                            );
-                                        } catch {
-                                            /* ignore */
-                                        }
-                                    }
                                 }
                             } else if (globalForcedJsonifyElementRaw) {
                                 try {
@@ -572,16 +494,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                         .some((s) => s.getName() === extendsMethodName);
                                     if (hasForcedGlobal) {
                                         targetRaw = globalForcedJsonifyElementRaw;
-                                        if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                            try {
-                                                console.log(
-                                                    "[Conditional] global forced element raw override",
-                                                    this.typeChecker.typeToString(globalForcedJsonifyElementRaw),
-                                                );
-                                            } catch {
-                                                /* ignore */
-                                            }
-                                        }
                                     }
                                 } catch {
                                     /* ignore */
@@ -597,11 +509,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                             .getPropertiesOfType(targetRaw)
                             .some((s) => s.getName() === extendsMethodName);
                     } catch {}
-                    if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                        try {
-                            console.log("[Conditional] object method pattern hasMethod initial", hasMethod);
-                        } catch {}
-                    }
                     if (!hasMethod) {
                         try {
                             const sym = (targetRaw as any)?.symbol as ts.Symbol | undefined;
@@ -635,14 +542,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                                 .getPropertiesOfType(cand)
                                                 .some((s) => s.getName() === extendsMethodName);
                                             if (has) {
-                                                if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                                    try {
-                                                        console.log(
-                                                            "[Conditional] rescue found method on ordered raw",
-                                                            this.typeChecker.typeToString(cand),
-                                                        );
-                                                    } catch {}
-                                                }
                                                 targetRaw = cand;
                                                 hasMethod = true;
                                                 break;
@@ -670,14 +569,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                         .getPropertiesOfType(cand)
                                         .some((s) => s.getName() === extendsMethodName);
                                     if (has) {
-                                        if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                            try {
-                                                console.log(
-                                                    "[Conditional] secondary rescue found method on raw",
-                                                    this.typeChecker.typeToString(cand),
-                                                );
-                                            } catch {}
-                                        }
                                         targetRaw = cand;
                                         hasMethod = true;
                                         break;
@@ -690,11 +581,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                             /* ignore */
                         }
                     }
-                    if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                        try {
-                            console.log("[Conditional] object method pattern hasMethod after decl scan", hasMethod);
-                        } catch {}
-                    }
                     if (hasMethod) {
                         try {
                             const methodSym = this.typeChecker
@@ -704,21 +590,11 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                         s.getName() === extendsMethodName ||
                                         s.getName() === extendsParamInferMethodName,
                                 );
-                            if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                try {
-                                    console.log("[Conditional] methodSym found?", !!methodSym);
-                                } catch {}
-                            }
                             if (methodSym) {
                                 const decl = methodSym.valueDeclaration ?? methodSym.declarations?.[0];
                                 if (decl) {
                                     const methodType = this.typeChecker.getTypeOfSymbolAtLocation(methodSym, decl);
                                     const sig = methodType.getCallSignatures()?.[0];
-                                    if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                        try {
-                                            console.log("[Conditional] method signature?", !!sig);
-                                        } catch {}
-                                    }
                                     if (sig) {
                                         // Decide whether we substitute return type (method(): infer U) or parameter type (method(param: infer U))
                                         if (
@@ -740,14 +616,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                                         /* ignore */
                                                     }
                                                     if (pType) {
-                                                        if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                                            try {
-                                                                console.log(
-                                                                    "[Conditional] method param inferred type",
-                                                                    this.typeChecker.typeToString(pType),
-                                                                );
-                                                            } catch {}
-                                                        }
                                                         const pNode = this.typeChecker.typeToTypeNode(
                                                             pType,
                                                             undefined,
@@ -771,14 +639,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                             }
                                         } else {
                                             const retType = sig.getReturnType();
-                                            if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                                try {
-                                                    console.log(
-                                                        "[Conditional] method return type",
-                                                        this.typeChecker.typeToString(retType),
-                                                    );
-                                                } catch {}
-                                            }
                                             const retNode = this.typeChecker.typeToTypeNode(
                                                 retType,
                                                 undefined,
@@ -1045,11 +905,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                         syntheticLate,
                                     );
                                     if (replaced) {
-                                        if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                            try {
-                                                console.log("[Conditional] late method fallback applied");
-                                            } catch {}
-                                        }
                                         finalType = replaced;
                                         return finalType;
                                     }
@@ -1103,11 +958,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                             syntheticArrayLate,
                                         );
                                         if (replacedArray) {
-                                            if (ConditionalTypeNodeParser.DEBUG_TYPES) {
-                                                try {
-                                                    console.log("[Conditional] late array method fallback applied");
-                                                } catch {}
-                                            }
                                             finalType = replacedArray;
                                             return finalType;
                                         }
