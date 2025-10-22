@@ -80,11 +80,6 @@ export class Context {
         return this.arguments;
     }
 
-    /** Get all stored original types (for propagation to child contexts) */
-    public getOriginalTypes(): Map<string, ts.Type> {
-        return this.originalTypes;
-    }
-
     /** Get original type by argument index (used when later binding parameter names) */
     public getOriginalTypeByIndex(index: number): ts.Type | undefined {
         return this.originalTypesInOrder[index];

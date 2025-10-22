@@ -349,17 +349,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
         }
 
         if (rawCheckType && rawExtendsType && extendsMethodName) {
-            // Attempt richer raw resolution for naked type parameters before any method pattern handling
-            try {
-                if (boundRawType && (boundRawType.flags & ts.TypeFlags.TypeParameter) !== 0) {
-                    const resolved = this.resolveTypeParameterRaw(boundRawType, context, extendsMethodName);
-                    if (resolved && resolved !== boundRawType) {
-                        boundRawType = resolved;
-                    }
-                }
-            } catch {
-                /* ignore */
-            }
             // Universal early shortcut: if checkType resolves to an array and its element type has the method, emit array of method return type immediately.
             try {
                 const elemRawEarly = this.typeChecker.getIndexTypeOfType(rawCheckType, ts.IndexKind.Number);
@@ -427,8 +416,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                     // Second chance enrichment if targetRaw still a naked type parameter without method
                     try {
                         if ((targetRaw.flags & ts.TypeFlags.TypeParameter) !== 0) {
-                            const again = this.resolveTypeParameterRaw(targetRaw, context, extendsMethodName);
-                            if (again) targetRaw = again;
                             // Fallback: use explicitly stored element raw from earlier array branch (Jsonify<E>[] scenario)
                             if ((targetRaw.flags & ts.TypeFlags.TypeParameter) !== 0) {
                                 try {
@@ -503,8 +490,7 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                     // Secondary rescue: scan all originalTypes map values for a non-type-parameter raw with the method.
                     if (!hasMethod) {
                         try {
-                            const originalsMap: Map<string, ts.Type> =
-                                (context as any).originalTypes?.() || context.getOriginalTypes?.() || new Map();
+                            const originalsMap: Map<string, ts.Type> = (context as any).originalTypes?.() || new Map();
                             const values: ts.Type[] = Array.from(originalsMap.values());
                             for (const cand of values) {
                                 if ((cand.flags & ts.TypeFlags.TypeParameter) !== 0) continue;
@@ -1098,86 +1084,5 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
             } catch {}
         }
         return subContext;
-    }
-
-    // Resolve a richer raw type for a naked type parameter by scanning ordered originals, originals map, and array element candidates.
-    private resolveTypeParameterRaw(original: ts.Type, context: Context, methodName: string): ts.Type | undefined {
-        // Ordered originals first (most recently pushed first is likely actual concrete raw)
-        try {
-            const ordered: any = (context as any).originalTypesInOrder;
-            if (Array.isArray(ordered)) {
-                for (const cand of ordered) {
-                    if ((cand.flags & ts.TypeFlags.TypeParameter) !== 0) continue;
-                    try {
-                        const apparent = this.typeChecker.getApparentType(cand);
-                        const props = this.typeChecker.getPropertiesOfType(apparent);
-                        if (props.some((p) => p.getName() === methodName)) return cand;
-                        const sym = (cand as any)?.symbol as ts.Symbol | undefined;
-                        const decls = sym?.declarations || [];
-                        for (const d of decls) {
-                            if (ts.isClassDeclaration(d)) {
-                                const hasMeth = d.members.some(
-                                    (m) =>
-                                        ts.isMethodDeclaration(m) &&
-                                        m.name &&
-                                        ts.isIdentifier(m.name) &&
-                                        m.name.text === methodName,
-                                );
-                                if (hasMeth) return cand;
-                            }
-                        }
-                        // Array element candidate
-                        const elem = this.typeChecker.getIndexTypeOfType(cand, ts.IndexKind.Number);
-                        if (elem) {
-                            const elemApparent = this.typeChecker.getApparentType(elem);
-                            const elemProps = this.typeChecker.getPropertiesOfType(elemApparent);
-                            if (elemProps.some((p) => p.getName() === methodName)) return elem;
-                        }
-                    } catch {
-                        /* ignore individual candidate errors */
-                    }
-                }
-            }
-        } catch {
-            /* ignore ordered scan errors */
-        }
-        // Originals map next
-        try {
-            const originalsMap: Map<string, ts.Type> =
-                (context as any).originalTypes?.() || context.getOriginalTypes?.() || new Map();
-            for (const cand of originalsMap.values()) {
-                if ((cand.flags & ts.TypeFlags.TypeParameter) !== 0) continue;
-                try {
-                    const apparent = this.typeChecker.getApparentType(cand);
-                    const props = this.typeChecker.getPropertiesOfType(apparent);
-                    if (props.some((p) => p.getName() === methodName)) return cand;
-                    const sym = (cand as any)?.symbol as ts.Symbol | undefined;
-                    const decls = sym?.declarations || [];
-                    for (const d of decls) {
-                        if (ts.isClassDeclaration(d)) {
-                            const hasMeth = d.members.some(
-                                (m) =>
-                                    ts.isMethodDeclaration(m) &&
-                                    m.name &&
-                                    ts.isIdentifier(m.name) &&
-                                    m.name.text === methodName,
-                            );
-                            if (hasMeth) return cand;
-                        }
-                    }
-                    const elem = this.typeChecker.getIndexTypeOfType(cand, ts.IndexKind.Number);
-                    if (elem) {
-                        const elemApparent = this.typeChecker.getApparentType(elem);
-                        const elemProps = this.typeChecker.getPropertiesOfType(elemApparent);
-                        if (elemProps.some((p) => p.getName() === methodName)) return elem;
-                    }
-                } catch {
-                    /* ignore */
-                }
-            }
-        } catch {
-            /* ignore map scan errors */
-        }
-        return undefined;
     }
 }
