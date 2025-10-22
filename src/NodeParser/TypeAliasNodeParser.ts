@@ -6,6 +6,20 @@ import type { BaseType } from "../Type/BaseType.js";
 import { NeverType } from "../Type/NeverType.js";
 import type { ReferenceType } from "../Type/ReferenceType.js";
 import { getKey } from "../Utils/nodeKey.js";
+import { buildAliasDescriptor } from "./AliasDescriptor.js";
+import { attemptBindMethodReturn } from "./MethodReturnExtractor.js";
+
+// Internal debug logging helper (enable by setting TS_JSG_DEBUG=1 in environment)
+const debugLog = (...args: any[]) => {
+    try {
+        if (process?.env?.TS_JSG_DEBUG) {
+            // eslint-disable-next-line no-console
+            console.log(...args);
+        }
+    } catch {
+        /* ignore */
+    }
+};
 
 export class TypeAliasNodeParser implements SubNodeParser {
     public constructor(
@@ -18,6 +32,17 @@ export class TypeAliasNodeParser implements SubNodeParser {
     }
 
     public createType(node: ts.TypeAliasDeclaration, context: Context, reference?: ReferenceType): BaseType {
+        // Step 1 of refactor: build & cache a structural descriptor of the alias' conditional chain.
+        // (Purely observational; doesn't change existing behaviour yet.)
+        let descriptorBuilt = false;
+        try {
+            const desc = buildAliasDescriptor(node);
+            descriptorBuilt = true;
+            // After generic parameter raw binding (later in function) we'll attempt method return binding.
+            // For early phases (before parameters processed) we only cache the descriptor.
+        } catch {
+            /* ignore descriptor build errors to avoid impacting existing flow */
+        }
         if (node.typeParameters?.length) {
             for (let i = 0; i < node.typeParameters.length; i++) {
                 const typeParam = node.typeParameters[i];
@@ -43,22 +68,16 @@ export class TypeAliasNodeParser implements SubNodeParser {
                     // Global fallback (last known element raw) if still a naked type parameter
                     if (raw && (raw.flags & ts.TypeFlags.TypeParameter) !== 0) {
                         try {
-                            const globalForced: ts.Type | undefined = (globalThis as any).__jsonifyElementRaw;
+                            const globalForced: ts.Type | undefined = (globalThis as any).__lastMethodElementRaw;
                             if (globalForced) {
-                                const props = this.typeChecker.getPropertiesOfType(globalForced);
-                                const hasMethod = props.some((p) => {
-                                    try {
-                                        const decl = p.valueDeclaration ?? p.declarations?.[0];
-                                        if (!decl) return false;
-                                        const t = this.typeChecker.getTypeOfSymbolAtLocation(p, decl);
-                                        return (t.getCallSignatures()?.length || 0) > 0;
-                                    } catch {
-                                        return false;
-                                    }
-                                });
-                                if (hasMethod) {
-                                    raw = globalForced;
-                                }
+                                // Unconditionally promote; method presence checked elsewhere
+                                raw = globalForced;
+                                debugLog(
+                                    "[debug alias promote] param",
+                                    nameSymbol.name,
+                                    "promoted from type param to lastMethodElementRaw=",
+                                    this.typeChecker.typeToString(globalForced),
+                                );
                             }
                         } catch {
                             /* ignore */
@@ -133,6 +152,26 @@ export class TypeAliasNodeParser implements SubNodeParser {
                 if (raw) {
                     const existingOriginal = context.getOriginalType(nameSymbol.name);
                     const isIndexed = (raw.flags & ts.TypeFlags.IndexedAccess) !== 0;
+                    if (i === 0) {
+                        debugLog(
+                            "[debug alias binding] param",
+                            nameSymbol.name,
+                            "raw=",
+                            this.typeChecker.typeToString(raw),
+                        );
+                        try {
+                            const propsDbg = this.typeChecker.getPropertiesOfType(raw).map((p) => p.getName());
+                            debugLog("[debug alias binding] props=", propsDbg);
+                            debugLog(
+                                "[debug alias binding flags]",
+                                (raw as any).flags,
+                                "isTypeParam",
+                                ((raw as any).flags & ts.TypeFlags.TypeParameter) !== 0,
+                            );
+                        } catch {
+                            /* ignore */
+                        }
+                    }
                     // If raw is a different type parameter (e.g., argument is E while alias param is T) and we have an original raw for that parameter, use it.
                     try {
                         if ((raw.flags & ts.TypeFlags.TypeParameter) !== 0) {
@@ -155,10 +194,10 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                         /* ignore */
                                     }
                                 }
-                                // Fallback: if alt not found, try _jsonifyElementRaw stored in context (for Jsonify<E>[] scenario)
+                                // Fallback: if alt not found, try _lastMethodElementRaw stored in context (generic last element with method scenario)
                                 if (!alt) {
                                     try {
-                                        const fallback = (context as any)._jsonifyElementRaw as ts.Type | undefined;
+                                        const fallback = (context as any)._lastMethodElementRaw as ts.Type | undefined;
                                         if (fallback) {
                                             // Ensure it actually has a method (any) to be considered richer
                                             let hasMethod = false;
@@ -421,6 +460,129 @@ export class TypeAliasNodeParser implements SubNodeParser {
             }
         }
 
+        // Step 2: if descriptor was built, attempt to pre-bind any infer variables from method-return segments.
+        if (descriptorBuilt) {
+            try {
+                const desc = buildAliasDescriptor(node); // retrieve cached
+                // Step 3 (array element promotion prior to method binding):
+                // If the alias contains both an array-infer segment and a later method-return-infer segment,
+                // and the currently bound raw for the generic parameter is still an array when we are in a
+                // recursive invocation (where we would prefer the element type), promote the element type
+                // (non-destructively) as a concreteRaw and, if it has methods, as the original type.
+                try {
+                    const hasArrayInfer = desc.chain.some((s) => s.pattern === "array-infer");
+                    const hasMethodInfer = desc.chain.some((s) => s.pattern === "method-return-infer");
+                    if (hasArrayInfer && hasMethodInfer && node.typeParameters?.length) {
+                        for (const tp of node.typeParameters) {
+                            const pname = tp.name.text;
+                            let raw = context.getOriginalType(pname) || (context as any).getConcreteRaw?.(pname);
+                            if (!raw) continue;
+                            // Only promote if raw is array and element appears to have at least one method (generic) OR its element's class has methods
+                            const elem = this.typeChecker.getIndexTypeOfType(raw, ts.IndexKind.Number);
+                            if (!elem) continue;
+                            let promote = false;
+                            try {
+                                const props = this.typeChecker.getPropertiesOfType(
+                                    this.typeChecker.getApparentType(elem),
+                                );
+                                promote = props.some((p) => {
+                                    try {
+                                        const decl = p.valueDeclaration ?? p.declarations?.[0];
+                                        if (!decl) return false;
+                                        const t = this.typeChecker.getTypeOfSymbolAtLocation(p, decl);
+                                        return (t.getCallSignatures()?.length || 0) > 0;
+                                    } catch {
+                                        return false;
+                                    }
+                                });
+                                // Class declaration enrichment if method not directly on apparent type
+                                if (!promote) {
+                                    const sym = (elem as any).symbol as ts.Symbol | undefined;
+                                    const decls = sym?.declarations || [];
+                                    for (const d of decls) {
+                                        if (ts.isClassDeclaration(d)) {
+                                            const classType = this.typeChecker.getTypeAtLocation(d);
+                                            const classProps = this.typeChecker.getPropertiesOfType(classType);
+                                            if (
+                                                classProps.some(
+                                                    (p) =>
+                                                        p.getName() === "toJSON" ||
+                                                        (p.getFlags() & ts.SymbolFlags.Method) !== 0,
+                                                )
+                                            ) {
+                                                raw = classType; // use enriched class type as element
+                                                promote = true;
+                                                break;
+                                            }
+                                        }
+                                    }
+                                }
+                            } catch {
+                                /* ignore */
+                            }
+                            if (!promote) continue;
+                            // Avoid overwriting an existing original that already has methods (non-array)
+                            const existing = context.getOriginalType(pname);
+                            let existingHasMethods = false;
+                            if (
+                                existing &&
+                                this.typeChecker.getIndexTypeOfType(existing, ts.IndexKind.Number) == null
+                            ) {
+                                try {
+                                    existingHasMethods = this.typeChecker.getPropertiesOfType(existing).some((p) => {
+                                        try {
+                                            const decl = p.valueDeclaration ?? p.declarations?.[0];
+                                            if (!decl) return false;
+                                            const t = this.typeChecker.getTypeOfSymbolAtLocation(p, decl);
+                                            return (t.getCallSignatures()?.length || 0) > 0;
+                                        } catch {
+                                            return false;
+                                        }
+                                    });
+                                } catch {
+                                    /* ignore */
+                                }
+                            }
+                            if (!existingHasMethods) {
+                                debugLog(
+                                    "[debug step3 promote] param",
+                                    pname,
+                                    "array element promoted to method-bearing type",
+                                );
+                                try {
+                                    (context as any).pushConcreteRaw?.(pname, raw);
+                                } catch {
+                                    /* ignore */
+                                }
+                                try {
+                                    context.pushOriginalType(pname, raw);
+                                } catch {
+                                    /* ignore */
+                                }
+                                try {
+                                    const ordered: ts.Type[] = (context as any).originalTypesInOrder || [];
+                                    if (!ordered.includes(raw))
+                                        (context as any).originalTypesInOrder = [raw, ...ordered];
+                                } catch {
+                                    /* ignore */
+                                }
+                            }
+                        }
+                    }
+                } catch {
+                    /* ignore */
+                }
+                const bindings = attemptBindMethodReturn(desc, this.typeChecker, context);
+                if (bindings.length)
+                    debugLog(
+                        "[debug method-return bindings]",
+                        bindings.map((b) => `${b.methodName}->${this.typeChecker.typeToString(b.returnType)}`),
+                    );
+            } catch {
+                /* ignore */
+            }
+        }
+
         const id = this.getTypeId(node, context);
         const name = this.getTypeName(node, context);
         if (reference) {
@@ -430,6 +592,159 @@ export class TypeAliasNodeParser implements SubNodeParser {
 
         // Detect presence of 'infer' within the alias type definition.
         let underlyingNode: ts.TypeNode = node.type;
+        // Structural optimization: conditional alias of form
+        //   T extends { method(): infer U } ? U : ...
+        // When the bound raw for T has the method, replace alias with method return type directly.
+        try {
+            if (ts.isConditionalTypeNode(underlyingNode) && ts.isTypeLiteralNode(underlyingNode.extendsType)) {
+                const methodMembers = underlyingNode.extendsType.members.filter((m) => ts.isMethodSignature(m));
+                if (methodMembers.length === 1 && ts.isMethodSignature(methodMembers[0])) {
+                    const sigMember = methodMembers[0];
+                    const ret = sigMember.type;
+                    if (ret && ts.isInferTypeNode(ret)) {
+                        const inferName = ret.typeParameter.name.text;
+                        // Check that checkType is the first (or only) type parameter reference.
+                        if (underlyingNode.checkType && node.typeParameters?.length) {
+                            const firstParamName = node.typeParameters[0].name.text;
+                            let boundRawPrimary = context.getOriginalType(firstParamName);
+                            if (!boundRawPrimary) {
+                                try {
+                                    boundRawPrimary = (context as any).getConcreteRaw?.(firstParamName);
+                                } catch {
+                                    /* ignore */
+                                }
+                            }
+                            const methodName =
+                                sigMember.name && ts.isIdentifier(sigMember.name) ? sigMember.name.text : undefined;
+                            if (methodName) {
+                                const candidates: ts.Type[] = [];
+                                if (boundRawPrimary) candidates.push(boundRawPrimary);
+                                try {
+                                    const concrete = (context as any).getConcreteRaw?.(firstParamName);
+                                    if (concrete && !candidates.includes(concrete)) candidates.push(concrete);
+                                } catch {
+                                    /* ignore */
+                                }
+                                try {
+                                    const ordered: ts.Type[] = (context as any).originalTypesInOrder || [];
+                                    for (const o of ordered) if (!candidates.includes(o)) candidates.push(o);
+                                } catch {
+                                    /* ignore */
+                                }
+                                try {
+                                    const globalElem: ts.Type | undefined = (globalThis as any).__lastMethodElementRaw;
+                                    if (globalElem && !candidates.includes(globalElem)) candidates.push(globalElem);
+                                } catch {
+                                    /* ignore */
+                                }
+                                try {
+                                    const ctxElem: ts.Type | undefined = (context as any)._lastMethodElementRaw;
+                                    if (ctxElem && !candidates.includes(ctxElem)) candidates.push(ctxElem);
+                                } catch {
+                                    /* ignore */
+                                }
+                                for (const cand of candidates) {
+                                    // Expand candidate set with its element type if it's an array-like and element may host the method.
+                                    const testCandidates: ts.Type[] = [cand];
+                                    try {
+                                        const elem = this.typeChecker.getIndexTypeOfType(cand, ts.IndexKind.Number);
+                                        if (elem && !testCandidates.includes(elem)) testCandidates.push(elem);
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                    for (const testCand of testCandidates) {
+                                        let hasMethod = false;
+                                        try {
+                                            hasMethod = this.typeChecker
+                                                .getPropertiesOfType(testCand)
+                                                .some((s) => s.getName() === methodName);
+                                        } catch {
+                                            /* ignore */
+                                        }
+                                        if (!hasMethod) continue;
+                                        try {
+                                            const methodSym = this.typeChecker
+                                                .getPropertiesOfType(testCand)
+                                                .find((s) => s.getName() === methodName);
+                                            const decl = methodSym?.valueDeclaration ?? methodSym?.declarations?.[0];
+                                            if (methodSym && decl) {
+                                                const methodType = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                    methodSym,
+                                                    decl,
+                                                );
+                                                const sig = methodType.getCallSignatures()?.[0];
+                                                if (sig) {
+                                                    const retType = sig.getReturnType();
+                                                    let rebuilt: ts.TypeNode | undefined;
+                                                    try {
+                                                        const props = this.typeChecker.getPropertiesOfType(retType);
+                                                        if (props.length) {
+                                                            const members: ts.TypeElement[] = [];
+                                                            for (const p of props) {
+                                                                const pDecl = p.valueDeclaration ?? p.declarations?.[0];
+                                                                let pType: ts.Type | undefined;
+                                                                try {
+                                                                    pType = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                                        p,
+                                                                        pDecl ?? decl,
+                                                                    );
+                                                                } catch {
+                                                                    /* ignore */
+                                                                }
+                                                                const pTypeNode = pType
+                                                                    ? this.typeChecker.typeToTypeNode(
+                                                                          pType,
+                                                                          undefined,
+                                                                          ts.NodeBuilderFlags.NoTruncation,
+                                                                      )
+                                                                    : ts.factory.createKeywordTypeNode(
+                                                                          ts.SyntaxKind.AnyKeyword,
+                                                                      );
+                                                                members.push(
+                                                                    ts.factory.createPropertySignature(
+                                                                        undefined,
+                                                                        ts.factory.createIdentifier(p.getName()),
+                                                                        undefined,
+                                                                        pTypeNode as ts.TypeNode,
+                                                                    ),
+                                                                );
+                                                            }
+                                                            rebuilt = ts.factory.createTypeLiteralNode(members);
+                                                        }
+                                                    } catch {
+                                                        /* ignore */
+                                                    }
+                                                    const retNode =
+                                                        rebuilt ||
+                                                        this.typeChecker.typeToTypeNode(
+                                                            retType,
+                                                            undefined,
+                                                            ts.NodeBuilderFlags.NoTruncation,
+                                                        );
+                                                    if (retNode && ts.isTypeNode(retNode)) {
+                                                        const direct = this.childNodeParser.createType(
+                                                            retNode as ts.TypeNode,
+                                                            context,
+                                                        );
+                                                        if (direct && !(direct instanceof NeverType)) {
+                                                            return new AliasType(id, direct);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        } catch {
+                                            /* ignore */
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            /* ignore */
+        }
         const type = this.childNodeParser.createType(underlyingNode, context);
         if (type instanceof NeverType) {
             return new NeverType();

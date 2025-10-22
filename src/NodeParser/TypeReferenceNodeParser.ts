@@ -67,6 +67,32 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                                         rawArg = parentOriginal;
                                     }
                                 }
+                                // Step 3 supplemental: if still a naked type parameter, try global/ctx element raw fallback.
+                                if ((rawArg.flags & ts.TypeFlags.TypeParameter) !== 0) {
+                                    try {
+                                        const elemFallback: ts.Type | undefined =
+                                            (context as any)._lastMethodElementRaw ||
+                                            (globalThis as any).__lastMethodElementRaw;
+                                        if (elemFallback) {
+                                            const hasMethod = this.typeChecker
+                                                .getPropertiesOfType(elemFallback)
+                                                .some((p) => p.getName() === "toJSON");
+                                            if (hasMethod) {
+                                                rawArg = elemFallback;
+                                                try {
+                                                    /* eslint-disable no-console */ console.log(
+                                                        "[debug teref promote] using element fallback for alias param",
+                                                        aliasParamName,
+                                                    );
+                                                } catch {
+                                                    /* ignore */
+                                                }
+                                            }
+                                        }
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                }
                             }
                             // Store as original raw for alias param if richer than existing.
                             const existing = sub.getOriginalType(aliasParamName);
@@ -109,7 +135,26 @@ export class TypeReferenceNodeParser implements SubNodeParser {
         }
 
         if (typeSymbol.flags & ts.SymbolFlags.TypeParameter) {
-            return context.getArgument(typeSymbol.name) ?? new UnknownType(true);
+            // Primary: bound generic argument
+            const bound = context.getArgument(typeSymbol.name);
+            if (bound) return bound;
+            // Fallback: if we have recorded an original/concrete raw ts.Type for this type parameter
+            // (e.g. an infer variable bound via method-return pre-binding) materialize it now instead
+            // of emitting an UnknownType placeholder.
+            try {
+                const raw: ts.Type | undefined =
+                    context.getOriginalType(typeSymbol.name) || (context as any).getConcreteRaw?.(typeSymbol.name);
+                if (raw) {
+                    const rawNode = this.typeChecker.typeToTypeNode(raw, undefined, ts.NodeBuilderFlags.NoTruncation);
+                    if (rawNode && ts.isTypeNode(rawNode)) {
+                        const realized = this.childNodeParser.createType(rawNode as ts.TypeNode, context);
+                        if (realized) return realized;
+                    }
+                }
+            } catch {
+                /* ignore */
+            }
+            return new UnknownType(true);
         }
 
         // Wraps promise type to avoid resolving to a empty Object type.
@@ -250,15 +295,21 @@ export class TypeReferenceNodeParser implements SubNodeParser {
 
         // Propagate parent original raw type mappings (parameter name -> ts.Type) so alias parsers can access method-bearing raws.
         try {
-            const originals: Map<string, ts.Type> =
-                (parentContext as any).originalTypes?.() ||
-                parentContext.getOriginalTypes?.() ||
-                parentContext.getOriginalTypes();
-            originals.forEach((value, key) => {
-                if (!subContext.getOriginalType(key)) {
-                    subContext.pushOriginalType(key, value);
+            let originalsMap: Map<string, ts.Type> | undefined = (parentContext as any).originalTypes?.();
+            if (!originalsMap && (parentContext as any).getOriginalTypes) {
+                try {
+                    originalsMap = (parentContext as any).getOriginalTypes();
+                } catch {
+                    /* ignore */
                 }
-            });
+            }
+            if (originalsMap) {
+                originalsMap.forEach((value, key) => {
+                    if (!subContext.getOriginalType(key)) {
+                        subContext.pushOriginalType(key, value);
+                    }
+                });
+            }
             // Propagate concreteRaw map
             try {
                 const concretes: Map<string, ts.Type> | undefined = (parentContext as any).getAllConcreteRaws?.();

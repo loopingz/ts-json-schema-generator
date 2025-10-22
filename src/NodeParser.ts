@@ -49,6 +49,11 @@ export class Context {
         return this.originalTypes.get(parameterName);
     }
 
+    /** Expose complete original types map for sub-context propagation */
+    public getOriginalTypes(): Map<string, ts.Type> {
+        return this.originalTypes;
+    }
+
     public setDefault(parameterName: string, argumentType: BaseType): void {
         this.defaultArgument.set(parameterName, argumentType);
     }

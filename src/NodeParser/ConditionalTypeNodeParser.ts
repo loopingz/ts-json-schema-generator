@@ -1,4 +1,15 @@
 import ts from "typescript";
+// Debug helper (enable with TS_JSG_DEBUG=1)
+const debugLog = (...args: any[]) => {
+    try {
+        if (process?.env?.TS_JSG_DEBUG) {
+            // eslint-disable-next-line no-console
+            console.log(...args);
+        }
+    } catch {
+        /* ignore */
+    }
+};
 import type { NodeParser } from "../NodeParser.js";
 import { Context } from "../NodeParser.js";
 import type { SubNodeParser } from "../SubNodeParser.js";
@@ -12,6 +23,122 @@ import { NeverType } from "../Type/NeverType.js";
 // where original propagation failed. This is a safety net to ensure method pattern
 // (e.g. toJSON(): infer U) can still find the concrete class raw.
 let globalForcedJsonifyElementRaw: ts.Type | undefined;
+
+/**
+ * Helper: given a candidate type and a method name, attempts to obtain a stable TypeNode describing
+ * the method return type. It prefers an explicit return type annotation from the method declaration
+ * when that annotation is an object/union/intersection/reference/array so we keep literal structure.
+ * Otherwise it resolves the signature, obtains the return ts.Type and (if object-like) rebuilds a
+ * type literal enumerating its properties to avoid loss of members during typeToTypeNode reduction.
+ */
+function buildMethodReturnNode(
+    typeChecker: ts.TypeChecker,
+    candidate: ts.Type,
+    methodName: string,
+): { retNode?: ts.TypeNode; methodDecl?: ts.MethodDeclaration } | undefined {
+    let methodSym: ts.Symbol | undefined;
+    try {
+        methodSym = typeChecker.getPropertiesOfType(candidate).find((s) => s.getName() === methodName);
+    } catch {
+        /* ignore */
+    }
+    let decl: ts.Declaration | undefined;
+    if (!methodSym) {
+        // Class declaration rescue: scan declarations for method symbol manually (prototype not on apparent type)
+        try {
+            const sym = (candidate as any).symbol as ts.Symbol | undefined;
+            const decls = sym?.declarations || [];
+            for (const d of decls) {
+                if (ts.isClassDeclaration(d)) {
+                    const m = d.members.find(
+                        (mm) =>
+                            ts.isMethodDeclaration(mm) &&
+                            mm.name &&
+                            ts.isIdentifier(mm.name) &&
+                            mm.name.text === methodName,
+                    );
+                    if (m) {
+                        decl = m;
+                        // Acquire symbol through class type for consistency
+                        try {
+                            const clsType = typeChecker.getTypeAtLocation(d);
+                            methodSym = typeChecker
+                                .getPropertiesOfType(clsType)
+                                .find((p) => p.getName() === methodName);
+                        } catch {
+                            /* ignore */
+                        }
+                        break;
+                    }
+                }
+            }
+        } catch {
+            /* ignore */
+        }
+    } else {
+        decl = methodSym.valueDeclaration ?? methodSym.declarations?.[0];
+    }
+    if (!methodSym || !decl) return undefined;
+
+    // Prefer explicit return annotation when structurally rich
+    if (ts.isMethodDeclaration(decl) && decl.type) {
+        const rt = decl.type;
+        if (
+            ts.isTypeLiteralNode(rt) ||
+            ts.isUnionTypeNode(rt) ||
+            ts.isIntersectionTypeNode(rt) ||
+            ts.isTypeReferenceNode(rt) ||
+            ts.isArrayTypeNode(rt)
+        ) {
+            return { retNode: rt as ts.TypeNode, methodDecl: decl };
+        }
+    }
+    // Fallback to signature evaluation
+    try {
+        const methodType = typeChecker.getTypeOfSymbolAtLocation(methodSym, decl);
+        const sig = methodType.getCallSignatures()?.[0];
+        if (!sig) return undefined;
+        const retType = sig.getReturnType();
+        // Rebuild literal from properties if any
+        let rebuilt: ts.TypeNode | undefined;
+        try {
+            const props = typeChecker.getPropertiesOfType(retType);
+            if (props.length) {
+                const members: ts.TypeElement[] = [];
+                for (const p of props) {
+                    const pDecl = p.valueDeclaration ?? p.declarations?.[0];
+                    let pType: ts.Type | undefined;
+                    try {
+                        pType = typeChecker.getTypeOfSymbolAtLocation(p, pDecl ?? decl);
+                    } catch {
+                        /* ignore */
+                    }
+                    const pTypeNode = pType
+                        ? typeChecker.typeToTypeNode(pType, undefined, ts.NodeBuilderFlags.NoTruncation)
+                        : ts.factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
+                    members.push(
+                        ts.factory.createPropertySignature(
+                            undefined,
+                            p.getName() === "__proto__"
+                                ? ts.factory.createIdentifier("__proto__")
+                                : ts.factory.createIdentifier(p.getName()),
+                            undefined,
+                            pTypeNode as ts.TypeNode,
+                        ),
+                    );
+                }
+                rebuilt = ts.factory.createTypeLiteralNode(members);
+            }
+        } catch {
+            /* ignore */
+        }
+        const retNode = rebuilt || typeChecker.typeToTypeNode(retType, undefined, ts.NodeBuilderFlags.NoTruncation);
+        if (retNode && ts.isTypeNode(retNode)) return { retNode: retNode as ts.TypeNode };
+    } catch {
+        /* ignore */
+    }
+    return undefined;
+}
 
 class CheckType {
     constructor(
@@ -165,7 +292,35 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
             /* ignore */
         }
 
-        const rawCheckType = boundRawType ?? this.typeChecker.getTypeFromTypeNode(node.checkType);
+        let rawCheckType = boundRawType ?? this.typeChecker.getTypeFromTypeNode(node.checkType);
+        // If the resolved rawCheckType is still a naked type parameter (e.g. 'E' from earlier 'infer E')
+        // attempt to lift its original (enriched) raw type from context so that method symbols (toJSON, etc.)
+        // are visible to subsequent method-pattern inference. This is pure abstraction (no alias name checks) and
+        // only replaces the check type when we can locate a concrete original for the type parameter.
+        try {
+            if (rawCheckType && (rawCheckType.flags & ts.TypeFlags.TypeParameter) !== 0) {
+                const sym = (rawCheckType as any).symbol as ts.Symbol | undefined;
+                const paramName = sym?.getName();
+                if (paramName) {
+                    const enriched = context.getOriginalType(paramName);
+                    if (enriched && enriched !== rawCheckType) {
+                        // Prefer enriched only if it actually has at least one method member (heuristic to avoid pointless swaps)
+                        try {
+                            const hasMethod = this.typeChecker
+                                .getPropertiesOfType(enriched)
+                                .some((p) => (p.getFlags() & ts.SymbolFlags.Method) !== 0);
+                            if (hasMethod) {
+                                rawCheckType = enriched;
+                            }
+                        } catch {
+                            /* ignore */
+                        }
+                    }
+                }
+            }
+        } catch {
+            /* ignore */
+        }
         const rawExtendsType = this.typeChecker.getTypeFromTypeNode(node.extendsType);
 
         // Unconditional array inference raw propagation: if extendsType matches infer array pattern capture raw element type for E.
@@ -221,17 +376,69 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                         ? this.typeChecker.getIndexTypeOfType(baseArrayRaw, ts.IndexKind.Number)
                         : undefined;
                     if (elemRawUniversal) {
-                        context.pushOriginalType(inferName, elemRawUniversal);
+                        // Attempt to enrich element raw with its declared class type (to preserve methods like toJSON)
+                        let enrichedElemRaw: ts.Type = elemRawUniversal;
                         try {
-                            (context as any).pushConcreteRaw?.(inferName, elemRawUniversal);
+                            const sym = (elemRawUniversal as any).symbol as ts.Symbol | undefined;
+                            const decls = sym?.declarations || [];
+                            const classDecl = decls.find((d: ts.Declaration) => ts.isClassDeclaration(d)) as
+                                | ts.ClassDeclaration
+                                | undefined;
+                            if (classDecl) {
+                                const classType = this.typeChecker.getTypeAtLocation(classDecl);
+                                // Prefer classType if it actually has methods (e.g. toJSON)
+                                const hasMethod = this.typeChecker
+                                    .getPropertiesOfType(classType)
+                                    .some((p) => p.getName() === "toJSON");
+                                if (hasMethod) {
+                                    enrichedElemRaw = classType;
+                                }
+                            }
+                        } catch {
+                            /* ignore */
+                        }
+                        // Decide whether to overwrite existing original based on method presence
+                        const existing = context.getOriginalType(inferName);
+                        let existingHasMethod = false;
+                        if (existing) {
+                            try {
+                                existingHasMethod = this.typeChecker
+                                    .getPropertiesOfType(existing)
+                                    .some((p) => p.getName() === "toJSON");
+                            } catch {
+                                /* ignore */
+                            }
+                        }
+                        const enrichedHasMethod = (() => {
+                            try {
+                                return this.typeChecker
+                                    .getPropertiesOfType(enrichedElemRaw)
+                                    .some((p) => p.getName() === "toJSON");
+                            } catch {
+                                return false;
+                            }
+                        })();
+                        if (!existing || (enrichedHasMethod && !existingHasMethod)) {
+                            context.pushOriginalType(inferName, enrichedElemRaw);
+                        }
+                        try {
+                            (context as any).pushConcreteRaw?.(inferName, enrichedElemRaw);
+                        } catch {
+                            /* ignore */
+                        }
+                        // Provide fallbacks for later alias parsing rescues
+                        try {
+                            (context as any)._lastMethodElementRaw = enrichedElemRaw;
+                            (globalThis as any).__lastMethodElementRaw = enrichedElemRaw;
                         } catch {
                             /* ignore */
                         }
                         try {
-                            // Put element raw at front of ordered originals for precedence
+                            // Put enriched element raw at front of ordered originals for precedence
                             const list: ts.Type[] = (context as any).originalTypesInOrder || [];
-                            (context as any).originalTypesInOrder = [elemRawUniversal, ...list];
-                            // Stash a forced element raw for nested Jsonify<E> where E context gets lost
+                            if (!list.includes(enrichedElemRaw)) {
+                                (context as any).originalTypesInOrder = [enrichedElemRaw, ...list];
+                            }
                         } catch {
                             /* ignore */
                         }
@@ -246,14 +453,111 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
         if (inferArrayInfo) {
             const inferName = inferArrayInfo.inferName;
             try {
-                const elemRaw = this.typeChecker.getIndexTypeOfType(rawCheckType, ts.IndexKind.Number);
+                let elemRaw = this.typeChecker.getIndexTypeOfType(rawCheckType, ts.IndexKind.Number);
                 if (elemRaw) {
+                    // Enrich element raw similarly to universal block
+                    try {
+                        const sym = (elemRaw as any).symbol as ts.Symbol | undefined;
+                        const decls = sym?.declarations || [];
+                        const classDecl = decls.find((d: ts.Declaration) => ts.isClassDeclaration(d)) as
+                            | ts.ClassDeclaration
+                            | undefined;
+                        if (classDecl) {
+                            const classType = this.typeChecker.getTypeAtLocation(classDecl);
+                            const hasMethod = this.typeChecker
+                                .getPropertiesOfType(classType)
+                                .some((p) => p.getName() === "toJSON");
+                            if (hasMethod) {
+                                elemRaw = classType;
+                            }
+                        }
+                    } catch {
+                        /* ignore */
+                    }
                     // Produce TypeNode for element raw, bind inferName -> element base type in inferMap
-                    const elemNode = this.typeChecker.typeToTypeNode(
+                    let elemNode: ts.TypeNode | undefined = this.typeChecker.typeToTypeNode(
                         elemRaw,
                         undefined,
                         ts.NodeBuilderFlags.NoTruncation,
-                    );
+                    ) as ts.TypeNode | undefined;
+                    // Build a synthetic minimal method-bearing literal if builder produced 'any' or failed.
+                    try {
+                        const elemAsString = this.typeChecker.typeToString(elemRaw);
+                        const props = this.typeChecker.getPropertiesOfType(elemRaw);
+                        const toJSONSym = props.find((p) => p.getName() === "toJSON");
+                        if (toJSONSym) {
+                            const decl = toJSONSym.valueDeclaration ?? toJSONSym.declarations?.[0];
+                            if (decl) {
+                                const methodType = this.typeChecker.getTypeOfSymbolAtLocation(toJSONSym, decl);
+                                const sig = methodType.getCallSignatures()?.[0];
+                                if (sig) {
+                                    const retType = sig.getReturnType();
+                                    let retNode = this.typeChecker.typeToTypeNode(
+                                        retType,
+                                        undefined,
+                                        ts.NodeBuilderFlags.NoTruncation,
+                                    ) as ts.TypeNode | undefined;
+                                    if (!retNode || retNode.kind === ts.SyntaxKind.AnyKeyword) {
+                                        // Rebuild object literal explicitly for stability
+                                        try {
+                                            const rprops = this.typeChecker.getPropertiesOfType(retType);
+                                            if (rprops.length) {
+                                                const members: ts.TypeElement[] = [];
+                                                for (const rp of rprops) {
+                                                    const rpDecl = rp.valueDeclaration ?? rp.declarations?.[0];
+                                                    let rpType: ts.Type | undefined;
+                                                    try {
+                                                        rpType = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                            rp,
+                                                            rpDecl ?? decl,
+                                                        );
+                                                    } catch {
+                                                        /* ignore */
+                                                    }
+                                                    const rpTypeNode = rpType
+                                                        ? this.typeChecker.typeToTypeNode(
+                                                              rpType,
+                                                              undefined,
+                                                              ts.NodeBuilderFlags.NoTruncation,
+                                                          )
+                                                        : ts.factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
+                                                    members.push(
+                                                        ts.factory.createPropertySignature(
+                                                            undefined,
+                                                            rp.getName(),
+                                                            undefined,
+                                                            rpTypeNode as ts.TypeNode,
+                                                        ),
+                                                    );
+                                                }
+                                                retNode = ts.factory.createTypeLiteralNode(members);
+                                            }
+                                        } catch {
+                                            /* ignore */
+                                        }
+                                    }
+                                    if (retNode) {
+                                        const methodSig = ts.factory.createMethodSignature(
+                                            undefined,
+                                            "toJSON",
+                                            undefined,
+                                            undefined,
+                                            [],
+                                            retNode,
+                                        );
+                                        elemNode = ts.factory.createTypeLiteralNode([methodSig]);
+                                        debugLog(
+                                            "[debug elem synth]",
+                                            elemAsString,
+                                            "-> synthetic literal with toJSON",
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    } catch {
+                        /* ignore */
+                    }
                     if (elemNode && ts.isTypeNode(elemNode)) {
                         const elemBaseType = this.childNodeParser.createType(elemNode, context);
                         inferMap.set(inferName, elemBaseType);
@@ -289,18 +593,26 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                         ) as ts.TypeAliasDeclaration | undefined;
                                         if (aliasDecl?.typeParameters?.length) {
                                             const aliasParamName = aliasDecl.typeParameters[0].name.text; // 'T' in Jsonify<T>
-                                            if (!sub.getOriginalType(aliasParamName)) {
-                                                sub.pushOriginalType(aliasParamName, elemRaw);
-                                                // Also push elemRaw into ordered originals at front of sub context
-                                                try {
-                                                    (sub as any).originalTypesInOrder = [
-                                                        elemRaw,
-                                                        ...((sub as any).originalTypesInOrder || []),
-                                                    ];
-                                                } catch {
-                                                    /* ignore */
-                                                }
+                                            // Always promote alias parameter original raw to enriched element raw for recursive invocation.
+                                            sub.pushOriginalType(aliasParamName, elemRaw);
+                                            try {
+                                                (sub as any).originalTypesInOrder = [
+                                                    elemRaw,
+                                                    ...((sub as any).originalTypesInOrder || []),
+                                                ];
+                                            } catch {
+                                                /* ignore */
                                             }
+                                            try {
+                                                (sub as any).pushConcreteRaw?.(aliasParamName, elemRaw);
+                                            } catch {
+                                                /* ignore */
+                                            }
+                                            debugLog(
+                                                "[debug promote recursive alias] param",
+                                                aliasParamName,
+                                                "-> element with methods",
+                                            );
                                         }
                                     }
                                 }
@@ -308,7 +620,36 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                         } catch {
                             /* ignore */
                         }
-                        const trueResolved = this.childNodeParser.createType(node.trueType, sub);
+                        // Substitute infer reference in recursive alias invocation: Jsonify<E>[] -> Jsonify<ElemRaw>[]
+                        let substitutedTrue: ts.TypeNode = node.trueType;
+                        try {
+                            if (
+                                ts.isArrayTypeNode(node.trueType) &&
+                                ts.isTypeReferenceNode(node.trueType.elementType) &&
+                                node.trueType.elementType.typeArguments?.length === 1 &&
+                                elemNode &&
+                                ts.isTypeNode(elemNode)
+                            ) {
+                                const targ = node.trueType.elementType.typeArguments[0];
+                                if (
+                                    ts.isTypeReferenceNode(targ) &&
+                                    ts.isIdentifier(targ.typeName) &&
+                                    targ.typeName.text === inferName
+                                ) {
+                                    const newRef = ts.factory.createTypeReferenceNode(
+                                        node.trueType.elementType.typeName,
+                                        [elemNode as ts.TypeNode],
+                                    );
+                                    substitutedTrue = ts.factory.createArrayTypeNode(newRef);
+                                    debugLog(
+                                        "[debug array infer] substituted Jsonify<infer> with concrete element type",
+                                    );
+                                }
+                            }
+                        } catch {
+                            /* ignore */
+                        }
+                        const trueResolved = this.childNodeParser.createType(substitutedTrue, sub);
                         if (trueResolved) return trueResolved;
                     }
                 }
@@ -328,6 +669,7 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                     if (ret && ts.isInferTypeNode(ret)) {
                         extendsMethodName = member.name.text;
                         extendsInferName = ret.typeParameter.name.text;
+                        debugLog("[debug detect] return-infer method=", extendsMethodName, "infer=", extendsInferName);
                         break; // prioritize return infer over param infer if both present
                     }
                     // Scan parameters for param: infer U pattern
@@ -335,6 +677,7 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                         for (const p of member.parameters) {
                             if (p.type && ts.isInferTypeNode(p.type)) {
                                 extendsParamInferMethodName = member.name.text;
+                                debugLog("[debug detect] param-infer method=", extendsParamInferMethodName);
                                 break;
                             }
                         }
@@ -345,58 +688,45 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
             // If only parameter-infer pattern detected, treat it as method pattern for downstream logic
             if (!extendsMethodName && extendsParamInferMethodName) {
                 extendsMethodName = extendsParamInferMethodName;
+                debugLog("[debug detect] promote param-infer to method=", extendsMethodName);
+            }
+        } else {
+            try {
+                const extText = (node.extendsType as any).getText?.() || "<no-text>";
+                if (extText.includes("toJSON")) {
+                    // eslint-disable-next-line no-console
+                    console.log(
+                        "[debug conditional-tojson] extendsType not TypeLiteral; kind=",
+                        node.extendsType.kind,
+                        "text=",
+                        extText.substring(0, 60),
+                    );
+                }
+            } catch {
+                /* ignore */
             }
         }
 
         if (rawCheckType && rawExtendsType && extendsMethodName) {
-            // Universal early shortcut: if checkType resolves to an array and its element type has the method, emit array of method return type immediately.
+            // Early shortcut: array element possesses method → directly emit array of return type.
             try {
                 const elemRawEarly = this.typeChecker.getIndexTypeOfType(rawCheckType, ts.IndexKind.Number);
                 if (elemRawEarly) {
-                    const elemApparentEarly = this.typeChecker.getApparentType(elemRawEarly);
-                    const hasMethodEarly = this.typeChecker
-                        .getPropertiesOfType(elemApparentEarly)
-                        .some((s) => s.getName() === extendsMethodName);
-                    if (hasMethodEarly) {
-                        const methodSymEarly = this.typeChecker
-                            .getPropertiesOfType(elemApparentEarly)
-                            .find((s) => s.getName() === extendsMethodName);
-                        if (methodSymEarly) {
-                            const declEarly = methodSymEarly.valueDeclaration ?? methodSymEarly.declarations?.[0];
-                            if (declEarly) {
-                                const methodTypeEarly = this.typeChecker.getTypeOfSymbolAtLocation(
-                                    methodSymEarly,
-                                    declEarly,
-                                );
-                                const sigEarly = methodTypeEarly.getCallSignatures()?.[0];
-                                if (sigEarly) {
-                                    const retTypeEarly = sigEarly.getReturnType();
-                                    const retNodeEarly = this.typeChecker.typeToTypeNode(
-                                        retTypeEarly,
-                                        undefined,
-                                        ts.NodeBuilderFlags.NoTruncation,
-                                    );
-                                    if (retNodeEarly && ts.isTypeNode(retNodeEarly)) {
-                                        const arrayNodeEarly = ts.factory.createArrayTypeNode(
-                                            retNodeEarly as ts.TypeNode,
-                                        );
-                                        const syntheticContextEarly = this.createSubContext(
-                                            node,
-                                            context,
-                                            checkTypeParameterName
-                                                ? new CheckType(checkTypeParameterName, checkType)
-                                                : undefined,
-                                            inferMap,
-                                        );
-                                        const earlyResolved = this.childNodeParser.createType(
-                                            arrayNodeEarly,
-                                            syntheticContextEarly,
-                                        );
-                                        if (earlyResolved) return earlyResolved;
-                                    }
-                                }
-                            }
-                        }
+                    const built = buildMethodReturnNode(
+                        this.typeChecker,
+                        this.typeChecker.getApparentType(elemRawEarly),
+                        extendsMethodName,
+                    );
+                    if (built?.retNode && ts.isTypeNode(built.retNode)) {
+                        const arrayNodeEarly = ts.factory.createArrayTypeNode(built.retNode as ts.TypeNode);
+                        const syntheticContextEarly = this.createSubContext(
+                            node,
+                            context,
+                            checkTypeParameterName ? new CheckType(checkTypeParameterName, checkType) : undefined,
+                            inferMap,
+                        );
+                        const earlyResolved = this.childNodeParser.createType(arrayNodeEarly, syntheticContextEarly);
+                        if (earlyResolved) return earlyResolved;
                     }
                 }
             } catch {
@@ -419,7 +749,7 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                             // Fallback: use explicitly stored element raw from earlier array branch (Jsonify<E>[] scenario)
                             if ((targetRaw.flags & ts.TypeFlags.TypeParameter) !== 0) {
                                 try {
-                                    const elemFallback: ts.Type | undefined = (context as any)._jsonifyElementRaw;
+                                    const elemFallback: ts.Type | undefined = (context as any)._lastMethodElementRaw;
                                     if (elemFallback) {
                                         const props = this.typeChecker.getPropertiesOfType(elemFallback);
                                         if (props.some((p) => p.getName() === extendsMethodName)) {
@@ -455,6 +785,15 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                     );
                                     if (meth) {
                                         hasMethod = true;
+                                        // Promote targetRaw to the concrete class type so subsequent getPropertiesOfType finds the method symbol
+                                        try {
+                                            const clsType = this.typeChecker.getTypeAtLocation(d);
+                                            if (clsType) {
+                                                targetRaw = clsType;
+                                            }
+                                        } catch {
+                                            /* ignore */
+                                        }
                                         break;
                                     }
                                 }
@@ -513,85 +852,149 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                     }
                     if (hasMethod) {
                         try {
-                            const methodSym = this.typeChecker
-                                .getPropertiesOfType(targetRaw)
-                                .find(
-                                    (s) =>
-                                        s.getName() === extendsMethodName ||
-                                        s.getName() === extendsParamInferMethodName,
-                                );
-                            if (methodSym) {
-                                const decl = methodSym.valueDeclaration ?? methodSym.declarations?.[0];
-                                if (decl) {
-                                    const methodType = this.typeChecker.getTypeOfSymbolAtLocation(methodSym, decl);
-                                    const sig = methodType.getCallSignatures()?.[0];
-                                    if (sig) {
-                                        // Decide whether we substitute return type (method(): infer U) or parameter type (method(param: infer U))
-                                        if (
-                                            extendsParamInferMethodName &&
-                                            methodSym.getName() === extendsParamInferMethodName
-                                        ) {
-                                            // Parameter infer: take first parameter type; if it's 'never' still substitute to propagate never upwards
-                                            const params = sig.getParameters();
-                                            if (params.length) {
-                                                const pDecl = params[0].valueDeclaration ?? params[0].declarations?.[0];
-                                                if (pDecl) {
+                            // Parameter infer path retained (rare) else use unified helper.
+                            let handled = false;
+                            if (extendsParamInferMethodName) {
+                                // True parameter-infer pattern: '{ fromDto(param: infer U): any }'
+                                // We must extract the FIRST parameter's instantiated type (after generic substitution)
+                                // rather than the method return type. Returning that type directly fulfills the
+                                // conditional true branch semantics (T extends { fromDto(param: infer U): any } ? U : T).
+                                try {
+                                    const methSym = this.typeChecker
+                                        .getPropertiesOfType(targetRaw)
+                                        .find((s) => s.getName() === extendsParamInferMethodName);
+                                    if (methSym) {
+                                        const mDecl = methSym.valueDeclaration ?? methSym.declarations?.[0];
+                                        if (mDecl) {
+                                            const mType = this.typeChecker.getTypeOfSymbolAtLocation(methSym, mDecl);
+                                            const sig = mType.getCallSignatures()?.[0];
+                                            if (sig) {
+                                                const sigParams = sig.getParameters();
+                                                if (sigParams.length) {
+                                                    const firstParam = sigParams[0];
+                                                    const pDecl =
+                                                        firstParam.valueDeclaration ?? firstParam.declarations?.[0];
                                                     let pType: ts.Type | undefined;
                                                     try {
                                                         pType = this.typeChecker.getTypeOfSymbolAtLocation(
-                                                            params[0],
-                                                            pDecl,
+                                                            firstParam,
+                                                            pDecl ?? mDecl,
                                                         );
                                                     } catch {
                                                         /* ignore */
                                                     }
                                                     if (pType) {
-                                                        const pNode = this.typeChecker.typeToTypeNode(
-                                                            pType,
-                                                            undefined,
-                                                            ts.NodeBuilderFlags.NoTruncation,
-                                                        );
-                                                        if (pNode && ts.isTypeNode(pNode)) {
-                                                            const syntheticParamCtx = this.createSubContext(
+                                                        // Build a stable TypeNode for parameter type; rebuild object literal if needed
+                                                        let paramNode: ts.TypeNode | undefined =
+                                                            this.typeChecker.typeToTypeNode(
+                                                                pType,
+                                                                undefined,
+                                                                ts.NodeBuilderFlags.NoTruncation,
+                                                            ) as ts.TypeNode | undefined;
+                                                        if (
+                                                            paramNode &&
+                                                            paramNode.kind === ts.SyntaxKind.AnyKeyword &&
+                                                            (pType.getFlags() & ts.TypeFlags.Object) !== 0
+                                                        ) {
+                                                            try {
+                                                                const pProps =
+                                                                    this.typeChecker.getPropertiesOfType(pType);
+                                                                if (pProps.length) {
+                                                                    const members: ts.TypeElement[] = [];
+                                                                    for (const pp of pProps) {
+                                                                        const ppDecl =
+                                                                            pp.valueDeclaration ?? pp.declarations?.[0];
+                                                                        let ppType: ts.Type | undefined;
+                                                                        try {
+                                                                            ppType =
+                                                                                this.typeChecker.getTypeOfSymbolAtLocation(
+                                                                                    pp,
+                                                                                    ppDecl ?? mDecl,
+                                                                                );
+                                                                        } catch {
+                                                                            /* ignore */
+                                                                        }
+                                                                        const ppTypeNode = ppType
+                                                                            ? this.typeChecker.typeToTypeNode(
+                                                                                  ppType,
+                                                                                  undefined,
+                                                                                  ts.NodeBuilderFlags.NoTruncation,
+                                                                              )
+                                                                            : ts.factory.createKeywordTypeNode(
+                                                                                  ts.SyntaxKind.AnyKeyword,
+                                                                              );
+                                                                        members.push(
+                                                                            ts.factory.createPropertySignature(
+                                                                                undefined,
+                                                                                pp.getName() === "__proto__"
+                                                                                    ? ts.factory.createIdentifier(
+                                                                                          "__proto__",
+                                                                                      )
+                                                                                    : ts.factory.createIdentifier(
+                                                                                          pp.getName(),
+                                                                                      ),
+                                                                                undefined,
+                                                                                ppTypeNode as ts.TypeNode,
+                                                                            ),
+                                                                        );
+                                                                    }
+                                                                    paramNode =
+                                                                        ts.factory.createTypeLiteralNode(members);
+                                                                }
+                                                            } catch {
+                                                                /* ignore */
+                                                            }
+                                                        }
+                                                        if (paramNode && ts.isTypeNode(paramNode)) {
+                                                            const syntheticContext = this.createSubContext(
                                                                 node,
                                                                 context,
                                                                 new CheckType(checkTypeParameterName, checkType),
                                                                 inferMap,
                                                             );
                                                             const resolvedParam = this.childNodeParser.createType(
-                                                                pNode as ts.TypeNode,
-                                                                syntheticParamCtx,
+                                                                paramNode as ts.TypeNode,
+                                                                syntheticContext,
                                                             );
-                                                            if (resolvedParam) return resolvedParam;
+                                                            if (resolvedParam) {
+                                                                // Mark handled so we don't fall back to return-type logic
+                                                                handled = true;
+                                                                return resolvedParam;
+                                                            }
                                                         }
                                                     }
                                                 }
                                             }
-                                        } else {
-                                            const retType = sig.getReturnType();
-                                            const retNode = this.typeChecker.typeToTypeNode(
-                                                retType,
-                                                undefined,
-                                                ts.NodeBuilderFlags.NoTruncation,
-                                            );
-                                            if (retNode && ts.isTypeNode(retNode)) {
-                                                const syntheticContext = this.createSubContext(
-                                                    node,
-                                                    context,
-                                                    new CheckType(checkTypeParameterName, checkType),
-                                                    inferMap,
-                                                );
-                                                const resolved = this.childNodeParser.createType(
-                                                    retNode as ts.TypeNode,
-                                                    syntheticContext,
-                                                );
-                                                if (resolved) return resolved;
-                                            }
                                         }
+                                    }
+                                } catch {
+                                    /* ignore */
+                                }
+                            }
+                            if (!handled) {
+                                const built = buildMethodReturnNode(this.typeChecker, targetRaw, extendsMethodName);
+                                if (built?.retNode && ts.isTypeNode(built.retNode)) {
+                                    const syntheticContext = this.createSubContext(
+                                        node,
+                                        context,
+                                        new CheckType(checkTypeParameterName, checkType),
+                                        inferMap,
+                                    );
+                                    const resolved = this.childNodeParser.createType(
+                                        built.retNode as ts.TypeNode,
+                                        syntheticContext,
+                                    );
+                                    if (resolved) {
+                                        if (extendsInferName && !inferMap.has(extendsInferName)) {
+                                            inferMap.set(extendsInferName, resolved);
+                                        }
+                                        return resolved;
                                     }
                                 }
                             }
-                        } catch {}
+                        } catch {
+                            /* ignore */
+                        }
                         return this.childNodeParser.createType(
                             node.trueType,
                             this.createSubContext(
@@ -601,6 +1004,91 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                 inferMap,
                             ),
                         );
+                    } else {
+                        // (Removed debug logging branch)
+                        // Final rescue fallback: attempt to derive method return type from any candidate types
+                        // available in context (ordered originals, originalTypes map, element raw) even if direct
+                        // property scan above failed to flip hasMethod. This covers cases where the raw type parameter
+                        // loses its method symbol through intermediate conditional evaluation but its apparent type
+                        // still exposes the method.
+                        try {
+                            if (extendsMethodName) {
+                                const candidateSet: ts.Type[] = [];
+                                try {
+                                    if (targetRaw) candidateSet.push(targetRaw);
+                                } catch {
+                                    /* ignore */
+                                }
+                                try {
+                                    const ordered: any = (context as any).originalTypesInOrder;
+                                    if (Array.isArray(ordered)) candidateSet.push(...ordered);
+                                } catch {
+                                    /* ignore */
+                                }
+                                try {
+                                    const originalsMap: Map<string, ts.Type> =
+                                        (context as any).originalTypes?.() || new Map();
+                                    candidateSet.push(...Array.from(originalsMap.values()));
+                                } catch {
+                                    /* ignore */
+                                }
+                                try {
+                                    const elemFallback: ts.Type | undefined = (context as any)._lastMethodElementRaw;
+                                    if (elemFallback) candidateSet.push(elemFallback);
+                                } catch {
+                                    /* ignore */
+                                }
+                                for (const cand of candidateSet) {
+                                    let methodSym: ts.Symbol | undefined;
+                                    try {
+                                        const apparent = this.typeChecker.getApparentType(cand);
+                                        methodSym = this.typeChecker
+                                            .getPropertiesOfType(apparent)
+                                            .find((s) => s.getName() === extendsMethodName);
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                    if (!methodSym) continue;
+                                    try {
+                                        const decl = methodSym.valueDeclaration ?? methodSym.declarations?.[0];
+                                        if (!decl) continue;
+                                        const methodType = this.typeChecker.getTypeOfSymbolAtLocation(methodSym, decl);
+                                        const sig = methodType.getCallSignatures()?.[0];
+                                        if (!sig) continue;
+                                        const retType = sig.getReturnType();
+                                        const retNode = this.typeChecker.typeToTypeNode(
+                                            retType,
+                                            undefined,
+                                            ts.NodeBuilderFlags.NoTruncation,
+                                        );
+                                        if (retNode && ts.isTypeNode(retNode)) {
+                                            const syntheticContext = this.createSubContext(
+                                                node,
+                                                context,
+                                                checkTypeParameterName
+                                                    ? new CheckType(checkTypeParameterName, checkType)
+                                                    : undefined,
+                                                inferMap,
+                                            );
+                                            const resolved = this.childNodeParser.createType(
+                                                retNode as ts.TypeNode,
+                                                syntheticContext,
+                                            );
+                                            if (resolved) {
+                                                if (extendsInferName && !inferMap.has(extendsInferName)) {
+                                                    inferMap.set(extendsInferName, resolved);
+                                                }
+                                                return resolved;
+                                            }
+                                        }
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                }
+                            }
+                        } catch {
+                            /* ignore */
+                        }
                     }
                 }
             }
@@ -614,6 +1102,22 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                             const hasMethodDecl = this.typeChecker
                                 .getPropertiesOfType(declType)
                                 .some((s) => s.getName() === extendsMethodName);
+                            try {
+                                // eslint-disable-next-line no-console
+                                console.log(
+                                    "[debug early concrete] type=",
+                                    node.checkType.typeName.getText(),
+                                    "extendsMethodName=",
+                                    extendsMethodName,
+                                    "hasMethodDecl=",
+                                    hasMethodDecl,
+                                    "props=",
+                                    this.typeChecker.getPropertiesOfType(declType).map((p) => p.getName()),
+                                );
+                            } catch {
+                                /* ignore */
+                            }
+                            // (Removed concrete branch debug logging)
                             if (hasMethodDecl) {
                                 const methodSym = this.typeChecker
                                     .getPropertiesOfType(declType)
@@ -621,15 +1125,87 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                 if (methodSym) {
                                     const mDecl = methodSym.valueDeclaration ?? methodSym.declarations?.[0];
                                     if (mDecl) {
+                                        // Concrete branch fallback: try explicit return type AST first for richer literal information.
+                                        if (ts.isMethodDeclaration(mDecl) && mDecl.type) {
+                                            const explicitRetNode = mDecl.type;
+                                            if (
+                                                ts.isTypeLiteralNode(explicitRetNode) ||
+                                                ts.isUnionTypeNode(explicitRetNode) ||
+                                                ts.isIntersectionTypeNode(explicitRetNode) ||
+                                                ts.isTypeReferenceNode(explicitRetNode) ||
+                                                ts.isArrayTypeNode(explicitRetNode)
+                                            ) {
+                                                try {
+                                                    const explicitCtx = this.createSubContext(
+                                                        node,
+                                                        context,
+                                                        undefined,
+                                                        inferMap,
+                                                    );
+                                                    const explicitParsed = this.childNodeParser.createType(
+                                                        explicitRetNode as ts.TypeNode,
+                                                        explicitCtx,
+                                                    );
+                                                    if (explicitParsed) return explicitParsed;
+                                                } catch {
+                                                    /* ignore */
+                                                }
+                                            }
+                                        }
                                         const methodType = this.typeChecker.getTypeOfSymbolAtLocation(methodSym, mDecl);
                                         const sig = methodType.getCallSignatures()?.[0];
                                         if (sig) {
                                             const retType = sig.getReturnType();
-                                            const retNode = this.typeChecker.typeToTypeNode(
-                                                retType,
-                                                undefined,
-                                                ts.NodeBuilderFlags.NoTruncation,
-                                            );
+                                            // Rebuild a fresh type literal from properties to avoid losing inferred literal members (e.g. 'upper').
+                                            let rebuiltRetNode: ts.TypeNode | undefined;
+                                            try {
+                                                const retProps = this.typeChecker.getPropertiesOfType(retType);
+                                                if (retProps.length) {
+                                                    const members: ts.TypeElement[] = [];
+                                                    for (const p of retProps) {
+                                                        const pDecl = p.valueDeclaration ?? p.declarations?.[0];
+                                                        let pType: ts.Type | undefined;
+                                                        try {
+                                                            pType = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                                p,
+                                                                pDecl ?? mDecl,
+                                                            );
+                                                        } catch {
+                                                            /* ignore */
+                                                        }
+                                                        const pTypeNode = pType
+                                                            ? this.typeChecker.typeToTypeNode(
+                                                                  pType,
+                                                                  undefined,
+                                                                  ts.NodeBuilderFlags.NoTruncation,
+                                                              )
+                                                            : undefined;
+                                                        members.push(
+                                                            ts.factory.createPropertySignature(
+                                                                undefined,
+                                                                p.getName() === "__proto__"
+                                                                    ? ts.factory.createIdentifier("__proto__")
+                                                                    : ts.factory.createIdentifier(p.getName()),
+                                                                undefined,
+                                                                (pTypeNode as ts.TypeNode) ||
+                                                                    ts.factory.createKeywordTypeNode(
+                                                                        ts.SyntaxKind.AnyKeyword,
+                                                                    ),
+                                                            ),
+                                                        );
+                                                    }
+                                                    rebuiltRetNode = ts.factory.createTypeLiteralNode(members);
+                                                }
+                                            } catch {
+                                                /* ignore */
+                                            }
+                                            const retNode =
+                                                rebuiltRetNode ||
+                                                this.typeChecker.typeToTypeNode(
+                                                    retType,
+                                                    undefined,
+                                                    ts.NodeBuilderFlags.NoTruncation,
+                                                );
                                             if (retNode && ts.isTypeNode(retNode)) {
                                                 const syntheticContext = this.createSubContext(
                                                     node,
@@ -646,6 +1222,7 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                         }
                                     }
                                 }
+                                // (Removed fallback debug logging)
                                 return this.childNodeParser.createType(
                                     node.trueType,
                                     this.createSubContext(node, context, undefined, inferMap),
@@ -716,7 +1293,14 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                                     undefined,
                                                     inferMap,
                                                 );
-                                                return this.childNodeParser.createType(arrayNode, syntheticContext);
+                                                const resolved = this.childNodeParser.createType(
+                                                    arrayNode,
+                                                    syntheticContext,
+                                                );
+                                                if (resolved && extendsInferName && !inferMap.has(extendsInferName)) {
+                                                    inferMap.set(extendsInferName, resolved);
+                                                }
+                                                return resolved;
                                             }
                                         }
                                     }
@@ -767,6 +1351,117 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
         }
 
         // Simple case: non-parameter
+        // Generic concrete method inference: if extends pattern is a method with infer and rawCheckType (apparent) owns that method,
+        // directly substitute with rebuilt method return type before falling back to assignability logic.
+        try {
+            if (checkTypeParameterName == null && extendsMethodName && ts.isTypeLiteralNode(node.extendsType)) {
+                const baseRaw = boundRawType ?? rawCheckType;
+                if (baseRaw) {
+                    let hasMethodConcrete = false;
+                    try {
+                        hasMethodConcrete = this.typeChecker
+                            .getPropertiesOfType(this.typeChecker.getApparentType(baseRaw))
+                            .some((s) => s.getName() === extendsMethodName);
+                    } catch {
+                        /* ignore */
+                    }
+                    try {
+                        // eslint-disable-next-line no-console
+                        console.log(
+                            "[debug conditional-tojson nested] extendsMethodName=",
+                            extendsMethodName,
+                            "baseRaw=",
+                            this.typeChecker.typeToString(baseRaw),
+                            "hasMethodConcrete=",
+                            hasMethodConcrete,
+                        );
+                    } catch {
+                        /* ignore */
+                    }
+                    if (hasMethodConcrete) {
+                        try {
+                            const methodSymConcrete = this.typeChecker
+                                .getPropertiesOfType(this.typeChecker.getApparentType(baseRaw))
+                                .find((s) => s.getName() === extendsMethodName);
+                            const declConcrete =
+                                methodSymConcrete?.valueDeclaration ?? methodSymConcrete?.declarations?.[0];
+                            if (methodSymConcrete && declConcrete) {
+                                const methodTypeConcrete = this.typeChecker.getTypeOfSymbolAtLocation(
+                                    methodSymConcrete,
+                                    declConcrete,
+                                );
+                                const sigConcrete = methodTypeConcrete.getCallSignatures()?.[0];
+                                if (sigConcrete) {
+                                    const retTypeConcrete = sigConcrete.getReturnType();
+                                    // Rebuild literal
+                                    let retLiteral: ts.TypeNode | undefined;
+                                    try {
+                                        const retProps = this.typeChecker.getPropertiesOfType(retTypeConcrete);
+                                        if (retProps.length) {
+                                            const members: ts.TypeElement[] = [];
+                                            for (const p of retProps) {
+                                                const pDecl = p.valueDeclaration ?? p.declarations?.[0];
+                                                let pType: ts.Type | undefined;
+                                                try {
+                                                    pType = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                        p,
+                                                        pDecl ?? declConcrete,
+                                                    );
+                                                } catch {
+                                                    /* ignore */
+                                                }
+                                                const pTypeNode = pType
+                                                    ? this.typeChecker.typeToTypeNode(
+                                                          pType,
+                                                          undefined,
+                                                          ts.NodeBuilderFlags.NoTruncation,
+                                                      )
+                                                    : ts.factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword);
+                                                members.push(
+                                                    ts.factory.createPropertySignature(
+                                                        undefined,
+                                                        ts.factory.createIdentifier(p.getName()),
+                                                        undefined,
+                                                        pTypeNode as ts.TypeNode,
+                                                    ),
+                                                );
+                                            }
+                                            retLiteral = ts.factory.createTypeLiteralNode(members);
+                                        }
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                    const retNodeConcrete =
+                                        retLiteral ||
+                                        this.typeChecker.typeToTypeNode(
+                                            retTypeConcrete,
+                                            undefined,
+                                            ts.NodeBuilderFlags.NoTruncation,
+                                        );
+                                    if (retNodeConcrete && ts.isTypeNode(retNodeConcrete)) {
+                                        const syntheticCtxConcrete = this.createSubContext(
+                                            node,
+                                            context,
+                                            undefined,
+                                            inferMap,
+                                        );
+                                        const resolvedConcrete = this.childNodeParser.createType(
+                                            retNodeConcrete as ts.TypeNode,
+                                            syntheticCtxConcrete,
+                                        );
+                                        if (resolvedConcrete) return resolvedConcrete;
+                                    }
+                                }
+                            }
+                        } catch {
+                            /* ignore */
+                        }
+                    }
+                }
+            }
+        } catch {
+            /* ignore */
+        }
         if (checkTypeParameterName == null) {
             const result = isAssignableTo(extendsType, checkType, inferMap);
             return this.childNodeParser.createType(
@@ -816,11 +1511,54 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                             const sigLate = methodTypeLate.getCallSignatures()?.[0];
                             if (sigLate) {
                                 const retTypeLate = sigLate.getReturnType();
-                                const retNodeLate = this.typeChecker.typeToTypeNode(
-                                    retTypeLate,
-                                    undefined,
-                                    ts.NodeBuilderFlags.NoTruncation,
-                                );
+                                // Rebuild literal for late substitution
+                                let rebuiltRetNodeLate: ts.TypeNode | undefined;
+                                try {
+                                    const retPropsLate = this.typeChecker.getPropertiesOfType(retTypeLate);
+                                    if (retPropsLate.length) {
+                                        const membersLate: ts.TypeElement[] = [];
+                                        for (const p of retPropsLate) {
+                                            const pDecl = p.valueDeclaration ?? p.declarations?.[0];
+                                            let pType: ts.Type | undefined;
+                                            try {
+                                                pType = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                    p,
+                                                    pDecl || declLate,
+                                                );
+                                            } catch {
+                                                /* ignore */
+                                            }
+                                            const pTypeNode = pType
+                                                ? this.typeChecker.typeToTypeNode(
+                                                      pType,
+                                                      undefined,
+                                                      ts.NodeBuilderFlags.NoTruncation,
+                                                  )
+                                                : undefined;
+                                            membersLate.push(
+                                                ts.factory.createPropertySignature(
+                                                    undefined,
+                                                    p.getName() === "__proto__"
+                                                        ? ts.factory.createIdentifier("__proto__")
+                                                        : ts.factory.createIdentifier(p.getName()),
+                                                    undefined,
+                                                    (pTypeNode as ts.TypeNode) ||
+                                                        ts.factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+                                                ),
+                                            );
+                                        }
+                                        rebuiltRetNodeLate = ts.factory.createTypeLiteralNode(membersLate);
+                                    }
+                                } catch {
+                                    /* ignore */
+                                }
+                                const retNodeLate =
+                                    rebuiltRetNodeLate ||
+                                    this.typeChecker.typeToTypeNode(
+                                        retTypeLate,
+                                        undefined,
+                                        ts.NodeBuilderFlags.NoTruncation,
+                                    );
                                 if (retNodeLate && ts.isTypeNode(retNodeLate)) {
                                     const syntheticLate = this.createSubContext(
                                         node,
@@ -866,11 +1604,54 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                 const sigElemLate = methodElemTypeLate.getCallSignatures()?.[0];
                                 if (sigElemLate) {
                                     const retElemTypeLate = sigElemLate.getReturnType();
-                                    const retElemNodeLate = this.typeChecker.typeToTypeNode(
-                                        retElemTypeLate,
-                                        undefined,
-                                        ts.NodeBuilderFlags.NoTruncation,
-                                    );
+                                    // Rebuild literal for array element late substitution
+                                    let rebuiltRetElemNodeLate: ts.TypeNode | undefined;
+                                    try {
+                                        const retElemPropsLate = this.typeChecker.getPropertiesOfType(retElemTypeLate);
+                                        if (retElemPropsLate.length) {
+                                            const membersElemLate: ts.TypeElement[] = [];
+                                            for (const p of retElemPropsLate) {
+                                                const pDecl = p.valueDeclaration ?? p.declarations?.[0];
+                                                let pType: ts.Type | undefined;
+                                                try {
+                                                    pType = this.typeChecker.getTypeOfSymbolAtLocation(
+                                                        p,
+                                                        pDecl || declElemLate,
+                                                    );
+                                                } catch {
+                                                    /* ignore */
+                                                }
+                                                const pTypeNode = pType
+                                                    ? this.typeChecker.typeToTypeNode(
+                                                          pType,
+                                                          undefined,
+                                                          ts.NodeBuilderFlags.NoTruncation,
+                                                      )
+                                                    : undefined;
+                                                membersElemLate.push(
+                                                    ts.factory.createPropertySignature(
+                                                        undefined,
+                                                        p.getName() === "__proto__"
+                                                            ? ts.factory.createIdentifier("__proto__")
+                                                            : ts.factory.createIdentifier(p.getName()),
+                                                        undefined,
+                                                        (pTypeNode as ts.TypeNode) ||
+                                                            ts.factory.createKeywordTypeNode(ts.SyntaxKind.AnyKeyword),
+                                                    ),
+                                                );
+                                            }
+                                            rebuiltRetElemNodeLate = ts.factory.createTypeLiteralNode(membersElemLate);
+                                        }
+                                    } catch {
+                                        /* ignore */
+                                    }
+                                    const retElemNodeLate =
+                                        rebuiltRetElemNodeLate ||
+                                        this.typeChecker.typeToTypeNode(
+                                            retElemTypeLate,
+                                            undefined,
+                                            ts.NodeBuilderFlags.NoTruncation,
+                                        );
                                     if (retElemNodeLate && ts.isTypeNode(retElemNodeLate)) {
                                         const arrayNodeLate = ts.factory.createArrayTypeNode(
                                             retElemNodeLate as ts.TypeNode,
