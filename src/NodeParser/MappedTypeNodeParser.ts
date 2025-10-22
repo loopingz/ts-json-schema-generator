@@ -118,51 +118,6 @@ export class MappedTypeNodeParser implements SubNodeParser {
                 const subContext = this.createSubContext(node, key, context);
                 const propertyType = this.childNodeParser.createType(node.type!, subContext);
 
-                // Attempt early substitution for method-based serialization patterns:
-                // 1. toJSON(): infer U (handled by finding toJSON and substituting its return type)
-                // 2. fromDto(param: infer U): any  (Dto pattern) -> we keep U's shape instead of the whole object
-                // Detect pattern by inspecting original raw type for this key name.
-                try {
-                    const keyName = key.getValue().toString();
-                    const rawProp = subContext.getOriginalType(keyName);
-                    if (rawProp) {
-                        const tc: ts.TypeChecker | undefined = (this.childNodeParser as any).typeChecker;
-                        if (tc) {
-                            // Skip arrays: let conditional branch handle (infer E)[] logic.
-                            const isArray = !!tc.getIndexTypeOfType(rawProp, ts.IndexKind.Number);
-                            if (!isArray) {
-                                const props = tc.getPropertiesOfType(rawProp);
-                                // Only consider explicit toJSON; ignore common prototype methods.
-                                const processMethodReturnType = (methodSym: ts.Symbol, label: string) => {
-                                    const decl = methodSym.valueDeclaration ?? methodSym.declarations?.[0];
-                                    if (!decl) return;
-                                    const mType = tc.getTypeOfSymbolAtLocation(methodSym, decl);
-                                    const sig = mType.getCallSignatures()?.[0];
-                                    if (!sig) return;
-                                    const ret = sig.getReturnType();
-                                    const retNode = tc.typeToTypeNode(ret, undefined, ts.NodeBuilderFlags.NoTruncation);
-                                    if (retNode && ts.isTypeNode(retNode)) {
-                                        const replaced = this.childNodeParser.createType(retNode, subContext);
-                                        if (replaced) {
-                                            (propertyType as any) = replaced;
-                                        }
-                                    }
-                                };
-                                const toJSONSym = props.find((p) => p.getName && p.getName() === "toJSON");
-                                if (toJSONSym) {
-                                    const declSource = (rawProp as any).symbol?.declarations || [];
-                                    const validDeclSource = declSource.some(
-                                        (d: ts.Declaration) => ts.isClassDeclaration(d) || ts.isInterfaceDeclaration(d),
-                                    );
-                                    if (validDeclSource) processMethodReturnType(toJSONSym, "toJSON");
-                                }
-                            }
-                        }
-                    }
-                } catch {
-                    /* ignore */
-                }
-
                 let newType = derefAnnotatedType(propertyType);
                 let hasUndefined = false;
                 if (newType instanceof UnionType) {
