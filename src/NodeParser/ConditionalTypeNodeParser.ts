@@ -232,13 +232,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                             const list: ts.Type[] = (context as any).originalTypesInOrder || [];
                             (context as any).originalTypesInOrder = [elemRawUniversal, ...list];
                             // Stash a forced element raw for nested Jsonify<E> where E context gets lost
-                            (context as any)._forcedJsonifyElementRaw = elemRawUniversal;
-                            globalForcedJsonifyElementRaw = elemRawUniversal;
-                            try {
-                                (globalThis as any).__jsonifyElementRaw = elemRawUniversal;
-                            } catch {
-                                /* ignore */
-                            }
                         } catch {
                             /* ignore */
                         }
@@ -307,26 +300,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                                 } catch {
                                                     /* ignore */
                                                 }
-                                                // Preemptively map any future naked type parameter T inside nested conditionals to elemRaw by storing fallback under a synthetic key
-                                                try {
-                                                    if (!(sub as any)._jsonifyElementRaw)
-                                                        (sub as any)._jsonifyElementRaw = elemRaw;
-                                                } catch {
-                                                    /* ignore */
-                                                }
-                                                // Also store forced fallback explicitly for nested Jsonify<E>
-                                                try {
-                                                    if (!(sub as any)._forcedJsonifyElementRaw)
-                                                        (sub as any)._forcedJsonifyElementRaw = elemRaw;
-                                                } catch {
-                                                    /* ignore */
-                                                }
-                                                try {
-                                                    globalForcedJsonifyElementRaw = elemRaw;
-                                                    (globalThis as any).__jsonifyElementRaw = elemRaw;
-                                                } catch {
-                                                    /* ignore */
-                                                }
                                             }
                                         }
                                     }
@@ -348,7 +321,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
         let extendsMethodName: string | undefined; // method name when return type contains infer
         let extendsInferName: string | undefined; // inferred type variable name from return type
         let extendsParamInferMethodName: string | undefined; // method name when parameter type contains infer
-        let extendsParamInferName: string | undefined; // inferred type variable name from parameter infer
         if (ts.isTypeLiteralNode(node.extendsType)) {
             for (const member of node.extendsType.members) {
                 if (ts.isMethodSignature(member) && member.name && ts.isIdentifier(member.name)) {
@@ -363,7 +335,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                         for (const p of member.parameters) {
                             if (p.type && ts.isInferTypeNode(p.type)) {
                                 extendsParamInferMethodName = member.name.text;
-                                extendsParamInferName = p.type.typeParameter.name.text;
                                 break;
                             }
                         }
@@ -467,33 +438,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                                         if (props.some((p) => p.getName() === extendsMethodName)) {
                                             targetRaw = elemFallback;
                                         }
-                                    }
-                                } catch {
-                                    /* ignore */
-                                }
-                            }
-                        }
-                    } catch {
-                        /* ignore */
-                    }
-                    // Ultimate forced fallback: if still a naked type parameter and a forced element raw exists with the method, substitute it.
-                    try {
-                        if ((targetRaw.flags & ts.TypeFlags.TypeParameter) !== 0) {
-                            const forced: ts.Type | undefined = (context as any)._forcedJsonifyElementRaw;
-                            if (forced) {
-                                const hasForced = this.typeChecker
-                                    .getPropertiesOfType(forced)
-                                    .some((s) => s.getName() === extendsMethodName);
-                                if (hasForced) {
-                                    targetRaw = forced;
-                                }
-                            } else if (globalForcedJsonifyElementRaw) {
-                                try {
-                                    const hasForcedGlobal = this.typeChecker
-                                        .getPropertiesOfType(globalForcedJsonifyElementRaw)
-                                        .some((s) => s.getName() === extendsMethodName);
-                                    if (hasForcedGlobal) {
-                                        targetRaw = globalForcedJsonifyElementRaw;
                                     }
                                 } catch {
                                     /* ignore */
@@ -1039,15 +983,6 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
                     subContext.pushOriginalTypeOrdered(t);
                 }
             }
-        } catch {
-            /* ignore */
-        }
-        // Propagate forced Jsonify element raw fallback (for nested Jsonify<E>)
-        try {
-            const forced = (parentContext as any)._forcedJsonifyElementRaw as ts.Type | undefined;
-            if (forced) (subContext as any)._forcedJsonifyElementRaw = forced;
-            const elem = (parentContext as any)._jsonifyElementRaw as ts.Type | undefined;
-            if (elem && !(subContext as any)._jsonifyElementRaw) (subContext as any)._jsonifyElementRaw = elem;
         } catch {
             /* ignore */
         }

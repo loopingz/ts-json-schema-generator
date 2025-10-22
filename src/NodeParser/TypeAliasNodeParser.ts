@@ -40,33 +40,8 @@ export class TypeAliasNodeParser implements SubNodeParser {
                 }
                 // Forced element raw fallback (added by ConditionalTypeNodeParser universal array infer)
                 try {
-                    const forced = (context as any)._forcedJsonifyElementRaw as ts.Type | undefined;
-                    if (forced) {
-                        // Use forced if no raw OR current raw is a naked type parameter (likely lost concrete) OR current raw has zero props while forced has some
-                        let useForced = !raw;
-                        try {
-                            if (!useForced && raw) {
-                                const isTypeParam = (raw.flags & ts.TypeFlags.TypeParameter) !== 0;
-                                if (isTypeParam) useForced = true;
-                                else {
-                                    const rawProps = this.typeChecker.getPropertiesOfType(raw);
-                                    const forcedProps = this.typeChecker.getPropertiesOfType(forced);
-                                    if (rawProps.length === 0 && forcedProps.length > 0) useForced = true;
-                                }
-                            }
-                        } catch {
-                            /* ignore */
-                        }
-                        if (useForced) {
-                            raw = forced;
-                        }
-                    }
                     // Global fallback (last known element raw) if still a naked type parameter
-                    if (
-                        raw &&
-                        (raw.flags & ts.TypeFlags.TypeParameter) !== 0 &&
-                        !(context as any)._forcedJsonifyElementRaw
-                    ) {
+                    if (raw && (raw.flags & ts.TypeFlags.TypeParameter) !== 0) {
                         try {
                             const globalForced: ts.Type | undefined = (globalThis as any).__jsonifyElementRaw;
                             if (globalForced) {
@@ -168,7 +143,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                 if (!alt) {
                                     try {
                                         alt = (context as any).getConcreteRaw?.(tparamName);
-                                        if (!alt) alt = (context as any)._forcedJsonifyElementRaw; // last resort
                                     } catch {
                                         /* ignore */
                                     }

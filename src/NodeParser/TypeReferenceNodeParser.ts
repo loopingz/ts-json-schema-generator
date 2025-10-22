@@ -67,54 +67,6 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                                         rawArg = parentOriginal;
                                     }
                                 }
-                                // Nested Jsonify<E> fallback: if still type parameter and forced element raw present, use it
-                                try {
-                                    if (
-                                        (rawArg.flags & ts.TypeFlags.TypeParameter) !== 0 &&
-                                        (context as any)._forcedJsonifyElementRaw
-                                    ) {
-                                        const forced = (context as any)._forcedJsonifyElementRaw as ts.Type;
-                                        // Ensure forced has at least one property or method to justify override
-                                        let useForced = false;
-                                        try {
-                                            useForced = this.typeChecker.getPropertiesOfType(forced).length > 0;
-                                        } catch {
-                                            /* ignore */
-                                        }
-                                        if (useForced) {
-                                            rawArg = forced;
-                                        }
-                                    }
-                                    // Global fallback if still naked
-                                    if (
-                                        (rawArg.flags & ts.TypeFlags.TypeParameter) !== 0 &&
-                                        !(context as any)._forcedJsonifyElementRaw
-                                    ) {
-                                        const gforced = (globalThis as any).__jsonifyElementRaw as ts.Type | undefined;
-                                        if (gforced) {
-                                            let hasMethod = false;
-                                            try {
-                                                hasMethod = this.typeChecker.getPropertiesOfType(gforced).some((p) => {
-                                                    try {
-                                                        const decl = p.valueDeclaration ?? p.declarations?.[0];
-                                                        if (!decl) return false;
-                                                        const t = this.typeChecker.getTypeOfSymbolAtLocation(p, decl);
-                                                        return (t.getCallSignatures()?.length || 0) > 0;
-                                                    } catch {
-                                                        return false;
-                                                    }
-                                                });
-                                            } catch {
-                                                /* ignore */
-                                            }
-                                            if (hasMethod) {
-                                                rawArg = gforced;
-                                            }
-                                        }
-                                    }
-                                } catch {
-                                    /* ignore */
-                                }
                             }
                             // Store as original raw for alias param if richer than existing.
                             const existing = sub.getOriginalType(aliasParamName);
@@ -329,19 +281,6 @@ export class TypeReferenceNodeParser implements SubNodeParser {
                         const exists = subList.some((x: ts.Type) => x === t);
                         if (!exists) subContext.pushOriginalTypeOrdered(t);
                     }
-                }
-            } catch {
-                /* ignore */
-            }
-            // Propagate forced Jsonify element raw fallback so nested Jsonify<E> can recover lost raw
-            try {
-                const forced = (parentContext as any)._forcedJsonifyElementRaw as ts.Type | undefined;
-                if (forced && !(subContext as any)._forcedJsonifyElementRaw) {
-                    (subContext as any)._forcedJsonifyElementRaw = forced;
-                }
-                const elem = (parentContext as any)._jsonifyElementRaw as ts.Type | undefined;
-                if (elem && !(subContext as any)._jsonifyElementRaw) {
-                    (subContext as any)._jsonifyElementRaw = elem;
                 }
             } catch {
                 /* ignore */
