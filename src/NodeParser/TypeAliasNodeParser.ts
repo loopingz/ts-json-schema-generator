@@ -203,33 +203,8 @@ export class TypeAliasNodeParser implements SubNodeParser {
                     } catch {
                         /* ignore */
                     }
-                    if (TypeAliasNodeParser.DEBUG_TYPES)
-                        try {
-                            console.log(
-                                "  binding raw for alias param",
-                                nameSymbol.name,
-                                this.typeChecker.typeToString(raw),
-                                raw.flags,
-                            );
-                        } catch {
-                            /* ignore */
-                        }
-                } else if (TypeAliasNodeParser.DEBUG_TYPES) {
-                    console.log("  no raw found for alias param", nameSymbol.name, i);
                 }
                 if (raw) {
-                    if (TypeAliasNodeParser.DEBUG_TYPES) {
-                        try {
-                            console.log(
-                                "[Alias] pre-binding final raw for",
-                                nameSymbol.name,
-                                "raw",
-                                this.typeChecker.typeToString(raw),
-                            );
-                        } catch {
-                            /* ignore */
-                        }
-                    }
                     const existingOriginal = context.getOriginalType(nameSymbol.name);
                     const isIndexed = (raw.flags & ts.TypeFlags.IndexedAccess) !== 0;
                     // If raw is a different type parameter (e.g., argument is E while alias param is T) and we have an original raw for that parameter, use it.
@@ -284,15 +259,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                     }
                                 }
                                 if (alt) {
-                                    if (TypeAliasNodeParser.DEBUG_TYPES)
-                                        console.log(
-                                            "  substituting type parameter raw",
-                                            tparamName,
-                                            "→",
-                                            this.typeChecker.typeToString(alt),
-                                            "for alias param",
-                                            nameSymbol.name,
-                                        );
                                     raw = alt;
                                 }
                                 // Last resort: if still naked type parameter, prefer concreteRaw for current alias param if richer
@@ -316,12 +282,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                                 });
                                             if (selfConcreteHasMethod) {
                                                 raw = selfConcrete;
-                                                if (TypeAliasNodeParser.DEBUG_TYPES)
-                                                    console.log(
-                                                        "  fallback to self concreteRaw for",
-                                                        nameSymbol.name,
-                                                        this.typeChecker.typeToString(selfConcrete),
-                                                    );
                                             }
                                         }
                                     } catch {
@@ -343,13 +303,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                             /* ignore */
                                         }
                                         if (hasMethod) {
-                                            if (TypeAliasNodeParser.DEBUG_TYPES)
-                                                console.log(
-                                                    "  ordered rescue replacing raw param",
-                                                    nameSymbol.name,
-                                                    "with",
-                                                    this.typeChecker.typeToString(cand),
-                                                );
                                             raw = cand;
                                             break;
                                         }
@@ -379,13 +332,6 @@ export class TypeAliasNodeParser implements SubNodeParser {
                                         /* ignore */
                                     }
                                     if (hasToJSON) {
-                                        if (TypeAliasNodeParser.DEBUG_TYPES)
-                                            console.log(
-                                                "  concreteRaw rescue replacing type param for",
-                                                nameSymbol.name,
-                                                "with",
-                                                this.typeChecker.typeToString(c),
-                                            );
                                         raw = c;
                                         break;
                                     }
