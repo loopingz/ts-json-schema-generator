@@ -57,6 +57,7 @@ describe("valid-data-other", () => {
     it("generic-default", assertValidSchema("generic-default", "MyObject"));
     it("generic-nested", assertValidSchema("generic-nested", "MyObject"));
     it("generic-prefixed-number", assertValidSchema("generic-prefixed-number", "MyObject"));
+    it("generic-this", assertValidSchema("generic-this", "Test2"));
     it("generic-true-hell", assertValidSchema("generic-true-hell", "MyObject"));
     it("generic-true-hell-2", assertValidSchema("generic-true-hell-2", "MyObject"));
     it("conditional-tojson-object", assertValidSchema("conditional-tojson-object", "MyObject"));

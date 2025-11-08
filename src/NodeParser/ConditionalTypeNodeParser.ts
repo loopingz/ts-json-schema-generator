@@ -18,11 +18,7 @@ import { isAssignableTo } from "../Utils/isAssignableTo.js";
 import { narrowType } from "../Utils/narrowType.js";
 import { UnionType } from "../Type/UnionType.js";
 import { NeverType } from "../Type/NeverType.js";
-
-// Global fallback for last captured Jsonify element raw to rescue nested contexts
-// where original propagation failed. This is a safety net to ensure method pattern
-// (e.g. toJSON(): infer U) can still find the concrete class raw.
-let globalForcedJsonifyElementRaw: ts.Type | undefined;
+// Removed unused globalForcedJsonifyElementRaw fallback which was never referenced.
 
 /**
  * Helper: given a candidate type and a method name, attempts to obtain a stable TypeNode describing
