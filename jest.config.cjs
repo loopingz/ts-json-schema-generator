@@ -4,7 +4,7 @@ const config = {
     moduleFileExtensions: ["js", "ts", "json"],
     testPathIgnorePatterns: ["<rootDir>/dist/", "<rootDir>/node_modules/", "<rootDir>/build/"],
     coverageDirectory: "./coverage/",
-    collectCoverage: false,
+    collectCoverage: true,
     testEnvironment: "node",
     transform: {
         ".*": "babel-jest",

@@ -115,10 +115,8 @@ export class MappedTypeNodeParser implements SubNodeParser {
             .map((type) => [type, this.mapKey(node, type, context)])
             .filter((value): value is [LiteralType, LiteralType] => value[1] instanceof LiteralType)
             .reduce((result: ObjectProperty[], [key, mappedKey]: [LiteralType, LiteralType]) => {
-                const propertyType = this.childNodeParser.createType(
-                    node.type!,
-                    this.createSubContext(node, key, context),
-                );
+                const subContext = this.createSubContext(node, key, context);
+                const propertyType = this.childNodeParser.createType(node.type!, subContext);
 
                 let newType = derefAnnotatedType(propertyType);
                 let hasUndefined = false;
@@ -181,13 +179,52 @@ export class MappedTypeNodeParser implements SubNodeParser {
     ): Context {
         const subContext = new Context(node);
 
+        // Propagate parameters, arguments and original raw types
         for (const parentParameter of parentContext.getParameters()) {
             subContext.pushParameter(parentParameter);
             subContext.pushArgument(parentContext.getArgument(parentParameter));
+            const original = parentContext.getOriginalType(parentParameter);
+            if (original) {
+                subContext.pushOriginalType(parentParameter, original);
+            }
         }
 
         subContext.pushParameter(node.typeParameter.name.text);
         subContext.pushArgument(key);
+        // Key is a literal; no original raw type needed
+
+        // Attempt to propagate raw property type for Jsonify mapped distribution:
+        // If parent generic parameter (e.g., T) has an original raw object with properties,
+        // find the property symbol matching this key literal and push its raw ts.Type for reuse.
+        try {
+            const parentParams = parentContext.getParameters();
+            // Attempt to find a suitable raw object among parent parameters (generic T or direct source object)
+            for (const paramName of parentParams) {
+                const rawObj = parentContext.getOriginalType(paramName);
+                if (!rawObj) continue;
+                const tc: ts.TypeChecker | undefined = (this.childNodeParser as any).typeChecker;
+                if (!tc) continue;
+                const props = tc.getPropertiesOfType(rawObj);
+                const keyName = (key as any).getValue ? (key as any).getValue().toString() : undefined;
+                if (!keyName) continue;
+                const propSym = props.find((p: any) => p.getName && p.getName() === keyName);
+                if (propSym) {
+                    const decl = propSym.valueDeclaration ?? propSym.declarations?.[0];
+                    if (decl) {
+                        const propRaw = tc.getTypeOfSymbolAtLocation(propSym, decl);
+                        if (propRaw) {
+                            subContext.pushOriginalType(paramName, rawObj);
+                            subContext.pushOriginalType(keyName, propRaw);
+                            if ((subContext as any).pushOriginalTypeOrdered) {
+                                (subContext as any).pushOriginalTypeOrdered(propRaw);
+                            }
+                        }
+                    }
+                }
+            }
+        } catch {
+            /* ignore */
+        }
 
         return subContext;
     }

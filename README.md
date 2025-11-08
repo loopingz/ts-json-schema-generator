@@ -16,6 +16,10 @@ Inspired by [`YousefED/typescript-json-schema`](https://github.com/YousefED/type
 
 This project is made possible by a [community of contributors](https://github.com/vega/ts-json-schema-generator/graphs/contributors). We welcome contributions of any kind (issues, code, documentation, examples, tests,...). Please read our [code of conduct](https://vega.github.io/vega/about/code-of-conduct).
 
+### Advanced Inference Internals
+
+Maintainers looking to understand or extend the recent conditional type + `toJSON` / DTO inference logic (return / parameter `infer`, array element enrichment, rescue ordering, synthetic method return reconstruction) should read the dedicated contributor note: [`docs/conditional-inference.md`](./docs/conditional-inference.md).
+
 ## CLI Usage
 
 Run the schema generator with npx:

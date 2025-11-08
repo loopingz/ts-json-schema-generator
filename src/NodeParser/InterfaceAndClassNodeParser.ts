@@ -93,13 +93,13 @@ export class InterfaceAndClassNodeParser implements SubNodeParser {
             return [];
         }
 
-        return node.heritageClauses.reduce(
-            (result: BaseType[], baseType) => [
+        return node.heritageClauses.reduce((result: BaseType[], baseType) => {
+            const expression = baseType.types[0];
+            return [
                 ...result,
                 ...baseType.types.map((expression) => this.childNodeParser.createType(expression, context)),
-            ],
-            [],
-        );
+            ];
+        }, []);
     }
 
     protected getProperties(
@@ -139,14 +139,13 @@ export class InterfaceAndClassNodeParser implements SubNodeParser {
                 }
                 return entries;
             }, [])
-            .map(
-                ({ member, memberType }) =>
-                    new ObjectProperty(
-                        this.getPropertyName(member.name),
-                        this.childNodeParser.createType(memberType, context),
-                        !member.questionToken,
-                    ),
-            )
+            .map(({ member, memberType }) => {
+                return new ObjectProperty(
+                    this.getPropertyName(member.name),
+                    this.childNodeParser.createType(memberType, context),
+                    !member.questionToken,
+                );
+            })
             .filter((prop) => {
                 const type = prop.getType();
                 if (prop.isRequired() && type instanceof NeverType) {
