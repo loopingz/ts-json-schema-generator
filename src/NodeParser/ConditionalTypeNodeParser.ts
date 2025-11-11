@@ -7,13 +7,11 @@ import { isAssignableTo } from "../Utils/isAssignableTo.js";
 import { narrowType } from "../Utils/narrowType.js";
 import { UnionType } from "../Type/UnionType.js";
 import { NeverType } from "../Type/NeverType.js";
-import { ObjectType } from "../Type/ObjectType.js";
 
 class CheckType {
     constructor(
         public parameterName: string,
         public type: BaseType,
-        public original?: BaseType,
     ) {}
 }
 
@@ -44,29 +42,8 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
         }
 
         // Narrow down check type for both condition branches
-        const trueCheckType = narrowType(checkType, (type) => isAssignableTo(extendsType, type, new Map()));
+        const trueCheckType = narrowType(checkType, (type) => isAssignableTo(extendsType, type, inferMap));
         const falseCheckType = narrowType(checkType, (type) => !isAssignableTo(extendsType, type));
-
-        // When we have a generic parameter `T`, we need to check the original type of `T` as well.
-        // For example, `T extends { toJSON(): infer U }`. The properties of `T` are stripped by default,
-        // so we need to check the original type.
-        // `isAssignableTo` will check both the narrowed type and the original type.
-        if (isAssignableTo(extendsType, checkType, inferMap) && trueCheckType instanceof ObjectType) {
-            const original = this.childNodeParser.createType(node.checkType, context.getOriginalContext());
-            if (isAssignableTo(extendsType, original, inferMap)) {
-                // We are in the true branch
-                const result = this.childNodeParser.createType(
-                    node.trueType,
-                    this.createSubContext(
-                        node,
-                        context,
-                        new CheckType(checkTypeParameterName, trueCheckType, original),
-                        inferMap,
-                    ),
-                );
-                return result;
-            }
-        }
 
         // Follow the relevant branches and return the results from them
         const results: BaseType[] = [];
@@ -124,6 +101,7 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
         inferMap: Map<string, BaseType> = new Map(),
     ): Context {
         const subContext = new Context(node);
+
         // Newly inferred types take precedence over check and parent types.
         inferMap.forEach((value, key) => {
             subContext.pushParameter(key);
@@ -132,12 +110,9 @@ export class ConditionalTypeNodeParser implements SubNodeParser {
 
         if (checkType !== undefined) {
             // Set new narrowed type for check type parameter
-            if (!inferMap.has(checkType.parameterName)) {
+            if (!(checkType.parameterName in inferMap)) {
                 subContext.pushParameter(checkType.parameterName);
                 subContext.pushArgument(checkType.type);
-            }
-            if (checkType.original) {
-                subContext.setOriginal(checkType.parameterName, checkType.original);
             }
         }
 
