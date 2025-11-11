@@ -22,6 +22,7 @@ import { EnumNodeParser } from "../src/NodeParser/EnumNodeParser.js";
 import { ExpressionWithTypeArgumentsNodeParser } from "../src/NodeParser/ExpressionWithTypeArgumentsNodeParser.js";
 import { FunctionNodeParser } from "../src/NodeParser/FunctionNodeParser.js";
 import { HiddenNodeParser } from "../src/NodeParser/HiddenTypeNodeParser.js";
+import { ThisTypeNodeParser } from "../src/NodeParser/ThisTypeNodeParser.js";
 import { IndexedAccessTypeNodeParser } from "../src/NodeParser/IndexedAccessTypeNodeParser.js";
 import { InferTypeNodeParser } from "../src/NodeParser/InferTypeNodeParser.js";
 import { InterfaceAndClassNodeParser } from "../src/NodeParser/InterfaceAndClassNodeParser.js";
@@ -103,6 +104,7 @@ export function createParser(program: ts.Program, config: CompletedConfig, augme
 
     chainNodeParser
         .addNodeParser(new HiddenNodeParser(typeChecker))
+        .addNodeParser(new ThisTypeNodeParser(typeChecker, chainNodeParser))
         .addNodeParser(new StringTypeNodeParser())
         .addNodeParser(new SymbolTypeNodeParser())
         .addNodeParser(new NumberTypeNodeParser())

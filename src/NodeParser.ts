@@ -10,9 +10,22 @@ export class Context {
     private parameters: string[] = [];
     private reference?: ts.Node;
     private defaultArgument = new Map<string, BaseType>();
+    private thisType?: BaseType;
+    private original = new Map<string, BaseType>();
 
     public constructor(reference?: ts.Node) {
         this.reference = reference;
+    }
+
+    public getOriginalContext(): Context {
+        const context = new Context(this.reference);
+        context.parameters = this.parameters;
+        context.arguments = [...this.original.values()];
+        return context;
+    }
+
+    public setOriginal(parameterName: string, argumentType: BaseType): void {
+        this.original.set(parameterName, argumentType);
     }
 
     public pushArgument(argumentType: BaseType): void {
@@ -57,6 +70,14 @@ export class Context {
 
     public getReference(): ts.Node | undefined {
         return this.reference;
+    }
+
+    public getThisType(): BaseType | undefined {
+        return this.thisType;
+    }
+
+    public setThisType(thisType: BaseType): void {
+        this.thisType = thisType;
     }
 }
 
