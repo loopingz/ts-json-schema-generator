@@ -132,6 +132,7 @@ describe("valid-data-type", () => {
     it("type-conditional-infer-nested", assertValidSchema("type-conditional-infer-nested", "MyType"));
     it("type-conditional-infer-recursive", assertValidSchema("type-conditional-infer-recursive", "MyType"));
     it("type-conditional-infer-rest", assertValidSchema("type-conditional-infer-rest", "MyType"));
+    it("type-conditional-infer-method", assertValidSchema("type-conditional-infer-method", "MyType"));
     it("type-conditional-infer-tail-recursion", assertValidSchema("type-conditional-infer-tail-recursion", "MyType"));
     it("type-conditional-infer-tuple-xor", assertValidSchema("type-conditional-infer-tuple-xor", "MyType"));
 
